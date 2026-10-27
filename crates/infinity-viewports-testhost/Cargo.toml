@@ -1,0 +1,16 @@
+[package]
+name = "infinity-viewports-testhost"
+description = "quick and dirty standin for the Infinity Manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+infinity-viewports-host.workspace = true
+infinity-viewports-protocol.workspace = true
+
+[[bin]]
+name = "infinity-viewports-testhost"
+path = "src/main.rs"
