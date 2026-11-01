@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::FreeLibraryAndExitThread;
 
-use infinity_viewports_protocol::{BridgeState, StatusCode, Tier};
+use infinity_viewports_protocol::{BridgeState, StatusCode};
 
 mod service;
 mod shared;
@@ -13,7 +13,7 @@ mod shared;
 use service::Bridge;
 
 static BRIDGE: OnceLock<Bridge> = OnceLock::new();
-/// CAS guard so the `DllMain` bootstrap and an explicit `rtt_bridge_start` call
+/// CAS guard so the `DllMain` bootstrap and an explicit `infinity_viewports_bridge_start` call
 /// cannot both start the bridge (which would create two mappings and threads).
 static STARTING: AtomicBool = AtomicBool::new(false);
 /// This DLL's module handle, captured in `DllMain`, so the service thread can
@@ -52,7 +52,7 @@ fn bootstrap(name: &str) -> u32 {
 /// # Safety
 /// Called by the host via a remote thread with a valid `arg`/`len` (or null/0).
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn rtt_bridge_start(arg: *const u8, len: usize) -> u32 {
+pub unsafe extern "system" fn infinity_viewports_bridge_start(arg: *const u8, len: usize) -> u32 {
     let name = if arg.is_null() || len == 0 {
         String::new()
     } else {
@@ -69,7 +69,7 @@ pub unsafe extern "system" fn rtt_bridge_start(arg: *const u8, len: usize) -> u3
 /// # Safety
 /// Called by the host.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn rtt_bridge_stop() -> u32 {
+pub unsafe extern "system" fn infinity_viewports_bridge_stop() -> u32 {
     if let Some(b) = BRIDGE.get() {
         b.request_shutdown();
     }
@@ -96,23 +96,12 @@ pub unsafe extern "system" fn DllMain(
         MODULE.store(module as usize, Ordering::Release);
         // Spawn the bootstrap off the loader-lock thread.
         let _ = std::thread::Builder::new()
-            .name("rtt-bootstrap".into())
+            .name("viewports-bootstrap".into())
             .spawn(|| {
                 bootstrap("");
             });
     }
     1
-}
-
-/// Re-exported for tests and `rtt-testhost` so they can assert the tier logic
-/// without the sim.
-pub fn describe_tier(t: Tier) -> &'static str {
-    match t {
-        Tier::Off => "off",
-        Tier::Full => "full (g-buffer + depth + clouds)",
-        Tier::DepthOnly => "depth-only",
-        Tier::ColourOnly => "colour-only",
-    }
 }
 
 pub fn describe_state(s: BridgeState) -> &'static str {

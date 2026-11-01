@@ -645,7 +645,7 @@ unsafe fn install_inner() -> Result<String, String> {
             .into();
 
         // Minimal hidden window to back the dummy swap chain.
-        let class = w!("RttFlirDummyWnd");
+        let class = w!("InfinityViewportsDummyWnd");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
@@ -656,7 +656,7 @@ unsafe fn install_inner() -> Result<String, String> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("rtt"),
+            w!("infinity-viewports"),
             WS_OVERLAPPEDWINDOW,
             0,
             0,

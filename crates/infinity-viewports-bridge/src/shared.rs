@@ -1,6 +1,6 @@
 //! Creation of the host↔bridge shared-memory block, bridge side.
 //!
-//! The bridge creates the named file mapping (`Local\InfinityRttFlir.{pid}`,
+//! The bridge creates the named file mapping (`Local\InfinityViewports.{pid}`,
 //! keyed on its own — i.e. the sim's — pid) that the host opens with
 //! `OpenFileMappingW`. The mapping is pagefile-backed and OS-zero-filled, so
 //! every atomic, seqlock and ring in [`SharedBlock`] starts at its zero value,
@@ -71,7 +71,7 @@ pub fn create() -> Option<Shared> {
     }
 }
 
-/// Create the larger, on-demand **video** mapping (`Local\InfinityRttFlir.{pid}
+/// Create the larger, on-demand **video** mapping (`Local\InfinityViewports.{pid}
 /// .vid`) for the live stream and return its base pointer. Pagefile-backed and
 /// OS-zero-filled, so the `VideoBlock` header starts zeroed (`seq == 0` = no
 /// frame yet). Handle leaked for the process lifetime (the host may read it, and

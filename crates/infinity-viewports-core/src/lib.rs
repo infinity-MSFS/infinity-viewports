@@ -182,7 +182,7 @@ fn install() {
 }
 
 fn teardown_event_name(pid: u32) -> String {
-    format!("Local\\InfinityRttNose.{pid}.teardown")
+    format!("Local\\InfinityViewports.{pid}.teardown")
 }
 
 fn unhook() -> bool {
@@ -242,7 +242,7 @@ unsafe extern "system" fn teardown_watcher(_: *mut c_void) -> u32 {
     log_line("teardown signal received; unhooking");
     let restored = unhook();
     log_line(&format!(
-        "unhook: slot restored={restored}; draining then unloading rtt_nose"
+        "unhook: slot restored={restored}; draining then unloading infinity_viewports_core"
     ));
     std::thread::sleep(Duration::from_millis(250));
     let module = MODULE.load(Ordering::Acquire);
@@ -286,7 +286,7 @@ fn log_path() -> Option<PathBuf> {
         return None;
     }
     let mut path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]));
-    path.set_file_name("rtt_nose.log");
+    path.set_file_name("infinity_viewports_core.log");
     let _ = PATH.set(path.clone());
     Some(path)
 }

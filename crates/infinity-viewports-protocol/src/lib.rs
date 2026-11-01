@@ -16,7 +16,7 @@ pub use seqlock::Seqlock;
 pub use status::*;
 pub use video::*;
 
-pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
+pub const PROTOCOL_VERSION_MAJOR: u16 = 2;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
 pub const SHARED_MAGIC: u32 = u32::from_le_bytes(*b"INFV");
 pub const SHARED_NAME_PREFIX: &str = "Local\\InfinityViewports";

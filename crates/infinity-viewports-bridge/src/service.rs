@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use infinity_viewports_gpu::Capturer;
 use infinity_viewports_protocol::{
-    BridgeState, CommandCode, LogLevel, LogRecord, SharedBlock, StatusCode, StatusSnapshot, Tier,
+    BridgeState, CommandCode, LogLevel, LogRecord, SharedBlock, StatusCode, StatusSnapshot,
 };
 
 use crate::shared;
@@ -40,7 +40,7 @@ impl Bridge {
         let addr = shared.ptr as usize;
         let pid = shared.pid;
         std::thread::Builder::new()
-            .name("rtt-flir".into())
+            .name("viewports-bridge".into())
             .spawn(move || service_loop(addr as *mut SharedBlock, pid, sd))
             .map_err(|_| StartError::Thread)?;
         Ok(Bridge { shutdown })
@@ -91,7 +91,7 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
     logger.log(
         LogLevel::Info,
         "bridge",
-        &format!("rtt-bridge live in pid {pid}; protocol handshake published"),
+        &format!("bridge live in pid {pid}; protocol handshake published"),
     );
 
     let mut capturer = Capturer::new();
@@ -258,7 +258,6 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
         st.generation = heartbeat;
         st.applied_config_generation = applied_gen;
         st.state_u8 = state_for(enabled, streaming) as u8;
-        st.tier_u8 = Tier::Off as u8;
         st.last_error_u16 = StatusCode::Ok as u16;
         st.fps = fps;
         st.frames = frames;

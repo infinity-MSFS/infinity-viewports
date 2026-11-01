@@ -1,27 +1,3 @@
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tier {
-    /// Not producing an image.
-    Off = 0,
-    /// G-buffer + depth + clouds.
-    Full = 1,
-    /// Geometry, sky, atmosphere, depth normals, colour-derived material.
-    DepthOnly = 2,
-    /// Weighted-RGB heat proxy.
-    ColourOnly = 3,
-}
-
-impl Tier {
-    pub fn from_u8(v: u8) -> Tier {
-        match v {
-            1 => Tier::Full,
-            2 => Tier::DepthOnly,
-            3 => Tier::ColourOnly,
-            _ => Tier::Off,
-        }
-    }
-}
-
 /// Coarse lifecycle of the bridge as the host sees it.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,8 +66,7 @@ pub struct StatusSnapshot {
     /// Echo of the `ConfigSnapshot.generation` the bridge has applied.
     pub applied_config_generation: u64,
     pub state_u8: u8,
-    pub tier_u8: u8,
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 3],
     pub last_error_u16: u16,
     pub _pad2: u16,
     /// Rolling averages.
@@ -110,8 +85,7 @@ impl StatusSnapshot {
         generation: 0,
         applied_config_generation: 0,
         state_u8: 0,
-        tier_u8: 0,
-        _pad: [0; 2],
+        _pad: [0; 3],
         last_error_u16: 0,
         _pad2: 0,
         frame_cost_ms: 0.0,

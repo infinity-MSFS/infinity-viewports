@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use error::{HostError, Result};
-pub use infinity_viewports_protocol::{
-    Band, BridgeState, HudGeometry, Palette, Polarity, SensorParams, StatusCode, Tier,
-};
+pub use infinity_viewports_protocol::{BridgeState, StatusCode};
 
 use channel::Channel;
 
@@ -109,10 +107,9 @@ impl Sim {
         self.pid
     }
 
-    pub fn flir(&self) -> Flir {
-        Flir {
-            channel: self.channel.clone(),
-        }
+    /// Bridge on/off. Off leaves the hooks installed but idle.
+    pub fn enable(&self, on: bool) -> Result<()> {
+        self.channel.update_config(|c| c.enabled = on as u8)
     }
 
     pub fn camera(&self) -> Result<camera::CameraLink> {
@@ -166,7 +163,7 @@ fn signal_nose_teardown(pid: u32) -> Result<()> {
     use windows::core::PCWSTR;
 
     const EVENT_MODIFY_STATE: u32 = 0x0002;
-    let name: Vec<u16> = format!("Local\\InfinityRttNose.{pid}.teardown\0")
+    let name: Vec<u16> = format!("Local\\InfinityViewports.{pid}.teardown\0")
         .encode_utf16()
         .collect();
     unsafe {
@@ -215,33 +212,9 @@ impl LogLine {
     }
 }
 
-#[derive(Clone)]
-pub struct Flir {
-    channel: Arc<Channel>,
-}
-
-impl Flir {
-    pub fn configure(&self, hud: HudGeometry) -> Result<()> {
-        self.channel.update_config(|c| c.hud = hud)
-    }
-    pub fn set_sensor(&self, params: SensorParams) -> Result<()> {
-        self.channel.update_config(|c| c.sensor = params)
-    }
-    pub fn set_environment(&self, env: infinity_viewports_protocol::EnvironmentWire) -> Result<()> {
-        self.channel.update_config(|c| c.env = env)
-    }
-    pub fn enable(&self, on: bool) -> Result<()> {
-        self.channel.update_config(|c| c.enabled = on as u8)
-    }
-    pub fn status(&self) -> Result<Status> {
-        self.channel.read_status().map(Status::from_wire)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Status {
     pub state: BridgeState,
-    pub tier: Tier,
     pub last_error: StatusCode,
     pub frame_cost_ms: f32,
     pub view_cost_ms: f32,
@@ -254,7 +227,6 @@ impl Status {
     fn from_wire(s: infinity_viewports_protocol::StatusSnapshot) -> Status {
         Status {
             state: BridgeState::from_u8(s.state_u8),
-            tier: Tier::from_u8(s.tier_u8),
             last_error: StatusCode::from_u16(s.last_error_u16),
             frame_cost_ms: s.frame_cost_ms,
             view_cost_ms: s.view_cost_ms,

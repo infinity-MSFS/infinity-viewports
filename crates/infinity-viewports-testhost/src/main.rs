@@ -3,7 +3,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use infinity_viewports_host::{Host, HostConfig, SimTarget};
-use infinity_viewports_protocol::{EnvironmentWire, HudGeometry, SensorParams};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -40,7 +39,7 @@ fn main() -> ExitCode {
     }
     let Some(bridge_path) = bridge else {
         eprintln!(
-            "usage: rtt-testhost --bridge <bridge.dll> [--once] [--inventory] [--scan-nose-layers <name>] [--watch-stream <out>] [--teardown|--peek|--grab <dir>]"
+            "usage: infinity-viewports-testhost --bridge <bridge.dll> [--once] [--inventory] [--scan-nose-layers <name>] [--watch-stream <out>] [--teardown|--peek|--grab <dir>]"
         );
         return ExitCode::from(2);
     };
@@ -68,7 +67,7 @@ fn main() -> ExitCode {
         println!("connected to pid {} (no inject)", sim.pid());
         match sim.teardown_nose() {
             Ok(()) => println!("nose teardown signalled"),
-            Err(e) => eprintln!("nose teardown: {e} (rtt_nose.dll not loaded?)"),
+            Err(e) => eprintln!("nose teardown: {e} (infinity_viewports_core.dll not loaded?)"),
         }
         match sim.teardown_bridge() {
             Ok(()) => println!("bridge teardown command sent"),
@@ -163,21 +162,7 @@ fn main() -> ExitCode {
     };
     println!("attached to pid {}", sim.pid());
 
-    let flir = sim.flir();
-    let _ = flir.configure(HudGeometry {
-        eye_m: [0.0, 0.1, 0.3],
-        fov_y_deg: 24.0,
-        aspect: 1.33,
-        render_size: [1024, 768],
-        beacon: infinity_viewports_protocol::BeaconSpec {
-            xy: [0, 0],
-            rgba: [1, 2, 3, 255],
-            target_size: [1024, 768],
-        },
-    });
-    let _ = flir.set_sensor(SensorParams::default());
-    let _ = flir.set_environment(fake_env());
-    let _ = flir.enable(true);
+    let _ = sim.enable(true);
 
     if let Some(out) = &watch_stream {
         if let Some(fmt) = stream_color {
@@ -236,8 +221,8 @@ fn main() -> ExitCode {
         }
         match sim.status() {
             Ok(s) => println!(
-                "state={:?} tier={:?} err={:?} hb={} fps={:.1} frames={} view={:.2}ms",
-                s.state, s.tier, s.last_error, s.heartbeat, s.fps, s.frames, s.view_cost_ms
+                "state={:?} err={:?} hb={} fps={:.1} frames={} view={:.2}ms",
+                s.state, s.last_error, s.heartbeat, s.fps, s.frames, s.view_cost_ms
             ),
             Err(e) => println!("status: {e}"),
         }
@@ -369,27 +354,5 @@ fn f10(u: u16) -> f32 {
         m as f32 / 32.0 * 2f32.powi(-14)
     } else {
         (1.0 + m as f32 / 32.0) * 2f32.powi(e as i32 - 15)
-    }
-}
-
-fn fake_env() -> EnvironmentWire {
-    EnvironmentWire {
-        ambient_temp_c: 15.0,
-        pressure_hpa: 1013.0,
-        humidity_pct: f32::NAN,
-        dewpoint_c: 9.0,
-        visibility_m: 15_000.0,
-        precip_kind: 0,
-        in_cloud: 0,
-        _pad: [0; 2],
-        precip_rate: 0.0,
-        wind_dir_deg: 270.0,
-        wind_speed_ms: 5.0,
-        lat_deg: 47.46,
-        lon_deg: -122.3,
-        alt_m: 500.0,
-        ground_alt_m: 130.0,
-        utc_unix_s: 1_718_971_200.0,
-        sun_dir: [f32::NAN; 3],
     }
 }
