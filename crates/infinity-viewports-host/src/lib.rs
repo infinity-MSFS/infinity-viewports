@@ -1,7 +1,7 @@
 pub mod camera;
 pub mod channel;
 pub mod error;
-mod geo;
+pub mod geo;
 pub mod inject;
 pub mod locate;
 pub mod simvars;

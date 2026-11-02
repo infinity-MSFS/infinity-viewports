@@ -56,13 +56,16 @@ struct Api {
 
 static API: OnceLock<Api> = OnceLock::new();
 
-struct Sample {
-    lat_deg: f64,
-    lon_deg: f64,
-    alt_ft: f64,
-    pitch_deg: f64,
-    bank_deg: f64,
-    heading_deg: f64,
+/// One SimConnect reading, RAW: the sim's own units and signs
+/// (`PLANE PITCH DEGREES` / `PLANE BANK DEGREES` as MSFS reports them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub alt_ft: f64,
+    pub pitch_deg: f64,
+    pub bank_deg: f64,
+    pub heading_deg: f64,
 }
 
 struct Conn {
@@ -134,6 +137,20 @@ impl AircraftFeed {
                 self.next_try = Instant::now() + RETRY;
             }
         }
+    }
+
+    /// The latest reading while it is fresh (under a second old), for a
+    /// consumer that builds its own pose with [`crate::geo::aircraft_pose`]
+    /// — e.g. to correct a sign convention without rebuilding this crate.
+    pub fn sample(&self) -> Option<Sample> {
+        let (sample, seen) = (self.sample.as_ref()?, self.seen?);
+        (seen.elapsed() <= STALE).then_some(*sample)
+    }
+
+    /// Why the feed has no data, if it has none (SimConnect missing, sim
+    /// closed, ...).
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     pub fn pose(&self) -> AircraftPose {
