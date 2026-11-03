@@ -154,6 +154,23 @@ pub fn basis_from_rows(rows: [[f64; 3]; 4]) -> Option<Basis> {
     })
 }
 
+/// The model transform `frame` and the telemetry pose `sim` describe the
+/// same aircraft: close (telemetry lags, so metres apart at speed) and
+/// pointing the same way.
+pub fn bases_agree(frame: &Basis, sim: &Basis) -> bool {
+    const MAX_APART_M: f64 = 150.0;
+    // cos 10 degrees.
+    const MIN_DOT: f64 = 0.985;
+    let d = [
+        frame.origin[0] - sim.origin[0],
+        frame.origin[1] - sim.origin[1],
+        frame.origin[2] - sim.origin[2],
+    ];
+    dot(d, d).sqrt() <= MAX_APART_M
+        && dot(frame.forward, sim.forward) >= MIN_DOT
+        && dot(frame.up, sim.up) >= MIN_DOT
+}
+
 pub fn basis_usable(b: &Basis) -> bool {
     if b.origin.iter().any(|c| !c.is_finite()) {
         return false;
@@ -240,6 +257,25 @@ fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_and_telemetry_agree_only_when_close_and_aligned() {
+        let a = Basis {
+            origin: [6_378_000.0, 0.0, 0.0],
+            right: [0.0, 1.0, 0.0],
+            up: [1.0, 0.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let mut b = a;
+        b.origin[2] += 40.0;
+        assert!(bases_agree(&a, &b), "telemetry lag at speed");
+        b.origin[2] += 200.0;
+        assert!(!bases_agree(&a, &b), "another object");
+        let mut c = a;
+        let t = 20f64.to_radians();
+        c.forward = [0.0, t.sin(), t.cos()];
+        assert!(!bases_agree(&a, &c), "pointing elsewhere");
+    }
 
     fn occ(w: i32, h: i32) -> ViewCand {
         ViewCand {

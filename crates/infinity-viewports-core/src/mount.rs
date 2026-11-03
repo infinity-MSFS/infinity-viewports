@@ -34,7 +34,6 @@ pub struct Mount {
 }
 
 pub struct Mounted {
-    pub basis: Option<Basis>,
     pub applied: u32,
     pub parented: u32,
     pub note: &'static str,
@@ -67,7 +66,6 @@ impl Mount {
                 self.give_back(our_view, our_node);
             }
             return Mounted {
-                basis: None,
                 applied: if self.parented {
                     APPLIED_PARENTED
                 } else {
@@ -86,7 +84,6 @@ impl Mount {
                 self.give_back(our_view, our_node);
             }
             return Mounted {
-                basis: None,
                 applied: if self.parented {
                     APPLIED_PARENTED
                 } else {
@@ -104,7 +101,6 @@ impl Mount {
         };
         let parented = self.ensure_parent(our_view, our_node, found.node);
         Mounted {
-            basis: Some(found.basis),
             applied: if parented {
                 APPLIED_PARENTED
             } else {
@@ -120,6 +116,12 @@ impl Mount {
             },
         }
     }
+    /// The aircraft model's axes as the scene holds them now, without
+    /// touching the scene graph.
+    pub fn frame_basis(&mut self, pilot_node: u64) -> Option<Basis> {
+        self.airframe(pilot_node).map(|f| f.basis)
+    }
+
     pub fn diagnose(&self, pilot_node: u64) -> String {
         if pilot_node == 0 {
             return "mount-diag: pilot_node=0".into();

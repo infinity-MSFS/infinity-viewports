@@ -157,7 +157,9 @@ impl Sim {
     }
 }
 
-fn signal_nose_teardown(pid: u32) -> Result<()> {
+/// Asks the core DLL in `pid` to erase its nose view and unload itself.
+/// Needs no bridge: it is a named event the core waits on.
+pub fn signal_nose_teardown(pid: u32) -> Result<()> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent};
     use windows::core::PCWSTR;

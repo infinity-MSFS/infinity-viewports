@@ -13,6 +13,18 @@ pub const APPLIED_PLACED: u32 = 1;
 pub const APPLIED_PARENTED: u32 = 2;
 pub const APPLIED_MISSING: u32 = 3;
 
+/// [`CameraStatus::nose`]: the core's own scene view. A core from before
+/// this field leaves it [`NOSE_UNKNOWN`].
+pub const NOSE_UNKNOWN: u16 = 0;
+/// Creating the view (or waiting for the sim to give it a slot).
+pub const NOSE_CREATING: u16 = 1;
+/// Rendering.
+pub const NOSE_LIVE: u16 = 2;
+/// The sim took the view away (or it failed); recreating after a backoff.
+pub const NOSE_REACQUIRING: u16 = 3;
+/// Given back for an unload; nothing more will be created.
+pub const NOSE_STOPPED: u16 = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct CameraControl {
@@ -66,9 +78,9 @@ impl CameraControl {
             MOUNT_FOLLOW
         };
         self._pad = 0;
-        self.right_m = clamp(self.right_m, -200.0, 200.0);
-        self.up_m = clamp(self.up_m, -200.0, 200.0);
-        self.forward_m = clamp(self.forward_m, -200.0, 200.0);
+        self.right_m = clamp(self.right_m, -500.0, 500.0);
+        self.up_m = clamp(self.up_m, -500.0, 500.0);
+        self.forward_m = clamp(self.forward_m, -500.0, 500.0);
         self.yaw_deg = clamp(self.yaw_deg, -180.0, 180.0);
         self.pitch_deg = clamp(self.pitch_deg, -89.0, 89.0);
         self.roll_deg = clamp(self.roll_deg, -180.0, 180.0);
@@ -95,7 +107,11 @@ pub struct CameraStatus {
     pub fov_deg: f32,
     pub near_m: f32,
     pub far_m: f32,
-    pub _pad: u32,
+    /// `NOSE_*`: the nose view's state.
+    pub nose: u16,
+    /// Times the nose view was lost and recreated since injection
+    /// (saturating).
+    pub nose_losses: u16,
     pub origin: [f64; 3],
     pub note: [u8; 96],
 }
@@ -108,7 +124,8 @@ impl CameraStatus {
             fov_deg: 0.0,
             near_m: 0.0,
             far_m: 0.0,
-            _pad: 0,
+            nose: NOSE_UNKNOWN,
+            nose_losses: 0,
             origin: [0.0; 3],
             note: [0; 96],
         }
@@ -276,8 +293,8 @@ mod tests {
         let clean = wild.sanitized();
         assert!(clean.valid());
         assert_eq!(clean.mount, MOUNT_FOLLOW);
-        assert_eq!(clean.right_m, -200.0);
-        assert_eq!(clean.up_m, 200.0);
+        assert_eq!(clean.right_m, -500.0);
+        assert_eq!(clean.up_m, 500.0);
         assert_eq!(clean.pitch_deg, 89.0);
         assert_eq!(clean.fov_deg, 1.0);
         assert_eq!(clean.near_m, 0.0);
@@ -289,6 +306,10 @@ mod tests {
         assert_eq!(core::mem::align_of::<CameraBlock>(), 8);
         assert_eq!(core::mem::offset_of!(CameraBlock, control), 4);
         assert_eq!(core::mem::offset_of!(CameraBlock, status) % 8, 0);
+        // The nose fields took the old `_pad: u32`: same layout as before.
+        assert_eq!(core::mem::offset_of!(CameraStatus, nose), 20);
+        assert_eq!(core::mem::offset_of!(CameraStatus, origin), 24);
+        assert_eq!(core::mem::size_of::<CameraStatus>(), 144);
         assert_eq!(
             core::mem::offset_of!(CameraBlock, status_lock) + core::mem::size_of::<Seqlock>(),
             core::mem::offset_of!(CameraBlock, status)

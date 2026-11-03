@@ -1,7 +1,9 @@
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use infinity_viewports_protocol::{
-    APPLIED_PLACED, CameraStatus, ECEF_MATCH_M, EcefMap, MOUNT_AIRCRAFT, fit_ecef, pose_populated,
+    APPLIED_FOLLOW, APPLIED_MISSING, APPLIED_PLACED, CameraStatus, ECEF_MATCH_M, EcefMap, MOUNT_AIRCRAFT,
+    NOSE_CREATING, NOSE_LIVE, NOSE_REACQUIRING, NOSE_STOPPED, fit_ecef, pose_populated,
 };
 use infinity_viewports_shim::{
     Faulted, guarded_activate, guarded_call1, guarded_call1_ret, guarded_call2, guarded_call2_ret,
@@ -40,6 +42,10 @@ struct Fns {
     refresh: Call1Ret,
 }
 
+/// The nose view's life. Nothing but [`Driver::release`] ends it: a view the
+/// sim takes away (a flight reload, a renderer reset, a slot reshuffle) or a
+/// step that fails goes to `Lost` and is recreated after a backoff, for as
+/// long as the core is loaded.
 #[derive(Clone, Copy)]
 enum Phase {
     Create,
@@ -52,14 +58,49 @@ enum Phase {
         view: u64,
         node: u64,
         camera: u64,
+        renderer: u64,
+        since: u64,
+        /// Consecutive frames the view failed its health check.
+        suspect: u32,
+    },
+    /// Recreate at frame `at`.
+    Lost {
+        at: u64,
     },
     Stopped,
 }
+
+/// Frames a live view may fail its health check before it counts as lost:
+/// rides out a frame where the sim is part-way through changing its tables.
+const SUSPECT_FRAMES: u32 = 3;
+/// Backoff before recreating, doubling per consecutive failure (about half a
+/// second up to ten at 60 fps).
+const RETRY_FIRST: u64 = 30;
+const RETRY_MAX: u64 = 600;
+/// A view live this long clears the failure count.
+const STABLE_FRAMES: u64 = 600;
+/// Frames to wait for a created entry to come up before erasing it.
+const READY_WAITS: u32 = 180;
+/// A manager whose entry we hold, not seen updating for this long while
+/// another one is: it was destroyed (a flight reload), our entry with it.
+const OWNER_GONE: Duration = Duration::from_secs(1);
 
 pub struct Driver {
     base: usize,
     fns: Fns,
     phase: Phase,
+    /// Updates of the owning manager (or of any manager while none owns).
+    frame: u64,
+    /// The view manager our entry lives in; 0 while there is none.
+    owner: u64,
+    owner_seen: Instant,
+    /// Consecutive attempts that ended lost; drives the backoff.
+    failures: u32,
+    /// Views lost since injection, for the host.
+    losses: u16,
+    /// What the host is told while the view is not live.
+    status_note: String,
+    slot_noted: bool,
     waits_for_slot: u32,
     zero_ids: u32,
     sized: bool,
@@ -67,6 +108,9 @@ pub struct Driver {
     proj_dumped: bool,
     ladder: [f32; 4],
     clip_logged: Option<(u32, u32, u32)>,
+    /// The view's own near plane, from before any near was written, so a
+    /// cleared setting gives it back.
+    stock_near: Option<f32>,
     mount_note: Option<&'static str>,
     mount_diag_done: bool,
     pose_lock: PoseLock,
@@ -116,6 +160,13 @@ impl Driver {
                 refresh: fn_at(base, REFRESH_OUTPUT),
             },
             phase: Phase::Create,
+            frame: 0,
+            owner: 0,
+            owner_seen: Instant::now(),
+            failures: 0,
+            losses: 0,
+            status_note: "creating the nose view".into(),
+            slot_noted: false,
             waits_for_slot: 0,
             zero_ids: 0,
             sized: false,
@@ -123,6 +174,7 @@ impl Driver {
             proj_dumped: false,
             ladder: [f32::NAN; 4],
             clip_logged: None,
+            stock_near: None,
             mount_note: None,
             mount_diag_done: false,
             pose_lock: PoseLock::Unknown,
@@ -139,7 +191,18 @@ impl Driver {
             Phase::Create => "create",
             Phase::Ready { .. } => "ready",
             Phase::Live { .. } => "live",
+            Phase::Lost { .. } => "lost",
             Phase::Stopped => "stopped",
+        }
+    }
+
+    fn nose_state(&self) -> u16 {
+        match self.phase {
+            Phase::Live { .. } => NOSE_LIVE,
+            Phase::Stopped => NOSE_STOPPED,
+            Phase::Lost { .. } => NOSE_REACQUIRING,
+            Phase::Create | Phase::Ready { .. } if self.losses > 0 => NOSE_REACQUIRING,
+            Phase::Create | Phase::Ready { .. } => NOSE_CREATING,
         }
     }
 
@@ -147,14 +210,84 @@ impl Driver {
         self.pending_note.take()
     }
 
-    pub fn step(&mut self, manager: *mut c_void) -> Result<(), String> {
-        if matches!(self.phase, Phase::Stopped) {
+    /// Gives the nose view back to the sim: closes and erases the entry this
+    /// driver created, so an unload leaves no extra view rendering (and no
+    /// slot taken) behind it. Must run where `step` runs, on the sim's
+    /// view-manager update. `Ok(false)` when this update is another
+    /// manager's and ours is still alive: call again on the next one.
+    /// Idempotent.
+    pub fn release(&mut self, manager: *mut c_void) -> Result<bool, String> {
+        let id = match self.phase {
+            Phase::Ready { id, .. } | Phase::Live { id, .. } => id,
+            Phase::Create | Phase::Lost { .. } | Phase::Stopped => {
+                self.stop("given back for an unload");
+                return Ok(true);
+            }
+        };
+        if manager.is_null() {
+            return Ok(false);
+        }
+        if manager as u64 != self.owner {
+            if self.owner_seen.elapsed() < OWNER_GONE {
+                return Ok(false);
+            }
+            // Our manager is gone, and the entry with it.
+            self.stop("given back for an unload");
+            return Ok(true);
+        }
+        let erased = self.erase_entry(manager, id);
+        self.stop("given back for an unload");
+        erased?;
+        self.note(format!("nose view {id:#x} erased"));
+        Ok(true)
+    }
+
+    fn stop(&mut self, why: &str) {
+        self.phase = Phase::Stopped;
+        self.owner = 0;
+        self.status_note = why.into();
+        self.publish_nose();
+    }
+
+    /// Closes and erases entry `id` if it is still in `manager`'s table.
+    fn erase_entry(&mut self, manager: *mut c_void, id: u64) -> Result<(), String> {
+        if !matches!(find_entry(manager as u64, id), Ok(Some(_))) {
             return Ok(());
         }
-        if manager.is_null() {
-            self.phase = Phase::Stopped;
-            return Err("manager pointer is null".into());
+        if let Phase::Live { view, node, .. } = self.phase {
+            // Undo a parenting before the node goes.
+            let _ = self.air.resolve(false, 0, view, node);
         }
+        unsafe {
+            guarded_activate(self.fns.activate, manager, id, false)
+                .map_err(fault("activate(close) on erase"))?;
+            guarded_call2(self.fns.erase, manager, id as usize as *mut c_void)
+                .map_err(fault("erase_entry"))?;
+        }
+        Ok(())
+    }
+
+    pub fn step(&mut self, manager: *mut c_void) -> Result<(), String> {
+        if matches!(self.phase, Phase::Stopped) || manager.is_null() {
+            return Ok(());
+        }
+        let m = manager as u64;
+        if self.owner != 0 {
+            if m == self.owner {
+                self.owner_seen = Instant::now();
+            } else if self.owner_seen.elapsed() < OWNER_GONE {
+                // Another manager instance's update; ours runs too.
+                return Ok(());
+            } else {
+                // Ours stopped updating: destroyed, and our entry with it.
+                // Nothing is left to erase.
+                self.owner = 0;
+                self.lost(None, "the view manager holding it went away");
+                self.publish_nose();
+                return Ok(());
+            }
+        }
+        self.frame += 1;
         let result = match self.phase {
             Phase::Create => self.try_create(manager),
             Phase::Ready { id, waits } => self.try_ready(manager, id, waits),
@@ -163,13 +296,89 @@ impl Driver {
                 view,
                 node,
                 camera,
-            } => self.track(id, view, node, camera),
+                renderer,
+                since,
+                suspect,
+            } => self.track(manager, id, view, node, camera, renderer, since, suspect),
+            Phase::Lost { at } => {
+                if self.frame >= at {
+                    self.phase = Phase::Create;
+                    self.status_note = "recreating the nose view".into();
+                }
+                Ok(())
+            }
             Phase::Stopped => Ok(()),
         };
-        if result.is_err() {
-            self.phase = Phase::Stopped;
+        if let Err(err) = &result {
+            let err = err.clone();
+            self.lost(Some(manager), &err);
         }
+        self.publish_nose();
         result
+    }
+
+    /// The view is gone or failed: erase what is left of it (when `manager`
+    /// still holds it) and schedule a fresh one.
+    fn lost(&mut self, manager: Option<*mut c_void>, why: &str) {
+        if let (Some(manager), Phase::Ready { id, .. } | Phase::Live { id, .. }) =
+            (manager, self.phase)
+            && manager as u64 == self.owner
+            && let Err(err) = self.erase_entry(manager, id)
+        {
+            self.note(format!("could not erase the lost entry {id:#x}: {err}"));
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.losses = self.losses.saturating_add(1);
+        let delay = retry_delay(self.failures);
+        self.phase = Phase::Lost {
+            at: self.frame + delay,
+        };
+        self.owner = 0;
+        self.reset_view_state();
+        self.status_note = format!("nose view lost ({why}); reacquiring");
+        self.note(format!(
+            "nose view lost: {why}; recreating in {delay} frames (attempt {})",
+            self.failures
+        ));
+    }
+
+    /// Forgets everything that belonged to the old view.
+    fn reset_view_state(&mut self) {
+        self.waits_for_slot = 0;
+        self.zero_ids = 0;
+        self.slot_noted = false;
+        self.sized = false;
+        self.refresh_noted = false;
+        self.ladder = [f32::NAN; 4];
+        self.clip_logged = None;
+        self.stock_near = None;
+        self.mount_note = None;
+        self.mount_diag_done = false;
+        self.air = Mount::new(self.base);
+        self.published = None;
+    }
+
+    /// Tells the host the view's state when it changes. While live,
+    /// [`publish_status`](Self::publish_status) carries it with the pose.
+    fn publish_nose(&mut self) {
+        let nose = self.nose_state();
+        let mut status = self.published.unwrap_or_else(CameraStatus::empty);
+        status.nose = nose;
+        status.nose_losses = self.losses;
+        if nose != NOSE_LIVE {
+            status.applied = APPLIED_MISSING;
+            status.parented = 0;
+            status.set_note(&self.status_note);
+        }
+        if self
+            .published
+            .as_ref()
+            .is_some_and(|prev| status_same(prev, &status))
+        {
+            return;
+        }
+        self.share.publish(status);
+        self.published = Some(status);
     }
 
     fn try_create(&mut self, manager: *mut c_void) -> Result<(), String> {
@@ -177,9 +386,13 @@ impl Driver {
             return Ok(());
         };
         if free_count(renderer)? == 0 {
+            // The sim's own views hold every slot: one frees up eventually,
+            // so keep waiting rather than give up.
             self.waits_for_slot += 1;
-            if self.waits_for_slot > 300 {
-                return Err("gave up waiting for a free scene-view slot".into());
+            if self.waits_for_slot > 300 && !self.slot_noted {
+                self.slot_noted = true;
+                self.status_note = "waiting for the sim to free a scene-view slot".into();
+                self.note("every scene-view slot is taken; waiting for one".into());
             }
             return Ok(());
         }
@@ -203,15 +416,17 @@ impl Driver {
             }
             return Ok(());
         }
-        self.pending_note = Some(format!("created entry {id:#x}"));
+        self.note(format!("created entry {id:#x}"));
+        self.owner = manager as u64;
+        self.owner_seen = Instant::now();
         self.phase = Phase::Ready { id, waits: 0 };
         Ok(())
     }
 
     fn try_ready(&mut self, manager: *mut c_void, id: u64, waits: u32) -> Result<(), String> {
-        if waits > 180 {
-            let _ = unsafe { guarded_call2(self.fns.erase, manager, id as usize as *mut c_void) };
-            return Err(format!("entry {id:#x} never became ready; erased"));
+        if waits > READY_WAITS {
+            // `lost` erases it.
+            return Err(format!("entry {id:#x} never became ready"));
         }
         let Some(entry) = find_entry(manager as u64, id)? else {
             self.phase = Phase::Ready {
@@ -316,18 +531,57 @@ impl Driver {
                 .map_err(fault("activate(open)"))?
         };
         self.note(format!("nose view live id={id:#x} view={view:#x} camera={camera:#x} size {NOSE_WIDTH}x{NOSE_HEIGHT}"));
+        if self.failures > 0 {
+            self.note(format!(
+                "nose view reacquired ({} lost since injection)",
+                self.losses
+            ));
+        }
         self.phase = Phase::Live {
             id,
             view,
             node,
             camera,
+            renderer,
+            since: self.frame,
+            suspect: 0,
         };
         Ok(())
     }
 
-    fn track(&mut self, id: u64, view: u64, node: u64, camera: u64) -> Result<(), String> {
-        if read_u64(node).is_err() {
-            return Err(format!("live entry {id:#x} node became unreadable"));
+    #[allow(clippy::too_many_arguments)]
+    fn track(
+        &mut self,
+        manager: *mut c_void,
+        id: u64,
+        view: u64,
+        node: u64,
+        camera: u64,
+        renderer: u64,
+        since: u64,
+        suspect: u32,
+    ) -> Result<(), String> {
+        let health = still_ours(self.base, manager as u64, id, view, node, camera, renderer);
+        let suspect = match health {
+            Ok(()) => 0,
+            Err(why) if suspect + 1 >= SUSPECT_FRAMES => return Err(why),
+            Err(_) => suspect + 1,
+        };
+        self.phase = Phase::Live {
+            id,
+            view,
+            node,
+            camera,
+            renderer,
+            since,
+            suspect,
+        };
+        if suspect != 0 {
+            // Not posed while in doubt: the node may already be freed.
+            return Ok(());
+        }
+        if self.failures > 0 && self.frame.saturating_sub(since) > STABLE_FRAMES {
+            self.failures = 0;
         }
         if !self.proj_dumped {
             self.proj_dumped = true;
@@ -391,18 +645,23 @@ impl Driver {
             return Ok(());
         }
         let control = self.share.read();
-        let sim = if control.mount == MOUNT_AIRCRAFT {
+        let on_aircraft = control.mount == MOUNT_AIRCRAFT;
+        let sim = if on_aircraft {
             self.sim_basis(eye)
         } else {
             None
         };
-        let mut mounted = self.air.resolve(
-            control.mount == MOUNT_AIRCRAFT && sim.is_none(),
-            pilot_node,
-            our_view,
-            node,
-        );
-        if control.mount == MOUNT_AIRCRAFT && sim.is_none() && mounted.basis.is_none() {
+        // The aircraft model's transform, read in this update: the camera
+        // moves with the drawn aircraft. The SimConnect pose arrives on the
+        // manager's clock and lags the frame by a varying amount, which
+        // shows as the nose jittering in the picture; it only checks the
+        // model transform, and stands in when there is none.
+        let frame = if on_aircraft {
+            self.air.frame_basis(pilot_node)
+        } else {
+            None
+        };
+        if on_aircraft && frame.is_none() {
             if !self.mount_diag_done {
                 self.mount_diag_done = true;
                 let diag = self.air.diagnose(pilot_node);
@@ -411,22 +670,49 @@ impl Driver {
         } else {
             self.mount_diag_done = false;
         }
-        let on_body = sim.is_some() || mounted.basis.is_some();
-        let basis = if mounted.parented != 0 {
-            None
-        } else if let Some(basis) = sim {
-            Some(basis)
-        } else if let Some(basis) = mounted.basis {
-            Some(basis)
-        } else if control.mount != MOUNT_AIRCRAFT {
-            pose::basis_from_look(eye, look_at, look_up)
+        let agreed = frame.filter(|f| sim.is_none_or(|s| pose::bases_agree(f, &s)));
+        let (basis, mounted) = if !on_aircraft {
+            (
+                pose::basis_from_look(eye, look_at, look_up),
+                Mounted {
+                    applied: APPLIED_FOLLOW,
+                    parented: 0,
+                    note: "following the pilot view",
+                },
+            )
+        } else if let Some(f) = agreed {
+            (
+                Some(f),
+                Mounted {
+                    applied: APPLIED_PLACED,
+                    parented: 0,
+                    note: "on the aircraft model, same frame",
+                },
+            )
+        } else if let Some(s) = sim {
+            (
+                Some(s),
+                Mounted {
+                    applied: APPLIED_PLACED,
+                    parented: 0,
+                    note: if frame.is_some() {
+                        "on the sim pose; the model transform disagreed with it"
+                    } else {
+                        "on the sim pose (no model transform; lags the frame)"
+                    },
+                },
+            )
         } else {
-            None
+            (
+                None,
+                Mounted {
+                    applied: APPLIED_MISSING,
+                    parented: 0,
+                    note: "no aircraft pose; camera held",
+                },
+            )
         };
-        if sim.is_some() && mounted.parented == 0 {
-            mounted.applied = APPLIED_PLACED;
-            mounted.note = "on the aircraft from sim pose";
-        }
+        let on_body = on_aircraft && basis.is_some();
         let mut origin = eye;
         if let Some(basis) = basis {
             let aim = if control.aim_m > 0.0 {
@@ -570,6 +856,8 @@ impl Driver {
         status.far_m = far;
         status.origin = origin;
         status.set_note(mounted.note);
+        status.nose = self.nose_state();
+        status.nose_losses = self.losses;
         if self
             .published
             .as_ref()
@@ -602,7 +890,8 @@ impl Driver {
         } else {
             (nose[1], nose[2], false)
         };
-        let want_near = if near_m > 0.0 { near_m } else { nose[0] };
+        let stock_near = *self.stock_near.get_or_insert(nose[0]);
+        let want_near = if near_m > 0.0 { near_m } else { stock_near };
         if !plausible_clip([want_near, want_far, want_default]) {
             return Ok((nose[0], nose[1]));
         }
@@ -727,6 +1016,8 @@ fn status_same(a: &CameraStatus, b: &CameraStatus) -> bool {
         && a.fov_deg.to_bits() == b.fov_deg.to_bits()
         && a.near_m.to_bits() == b.near_m.to_bits()
         && a.far_m.to_bits() == b.far_m.to_bits()
+        && a.nose == b.nose
+        && a.nose_losses == b.nose_losses
         && a.note == b.note
 }
 
@@ -847,6 +1138,53 @@ fn diff_plausible_f32(a: u64, b: u64, start: u64, end: u64) -> Vec<String> {
         out.push("    (none)".into());
     }
     out
+}
+
+/// Frames to wait before the `failures`-th consecutive recreate.
+fn retry_delay(failures: u32) -> u64 {
+    (RETRY_FIRST << failures.saturating_sub(1).min(8)).min(RETRY_MAX)
+}
+
+/// Whether the live view is still the one we made: the entry still in the
+/// table and ready, on the same slot, bound to the same node and camera, in
+/// the same renderer. Otherwise, why not.
+fn still_ours(
+    base: usize,
+    manager: u64,
+    id: u64,
+    view: u64,
+    node: u64,
+    camera: u64,
+    renderer: u64,
+) -> Result<(), String> {
+    if read_global(base, RENDERER_GLOBAL)? != Some(renderer) {
+        return Err("the renderer was replaced".into());
+    }
+    let Some(entry) = find_entry(manager, id)? else {
+        return Err(format!("the sim removed entry {id:#x}"));
+    };
+    if read_u8(entry + ENTRY_READY)? != 1 {
+        return Err(format!("entry {id:#x} is no longer ready"));
+    }
+    let index = read_i32(entry + ENTRY_VIEW_INDEX)?;
+    if !(0..VIEW_SLOTS as i32).contains(&index) {
+        return Err(format!("entry {id:#x} lost its view slot"));
+    }
+    let array = read_u64(renderer + RENDERER_VIEW_ARRAY)?;
+    if read_u64(array + index as u64 * 8)? != view {
+        return Err(format!("entry {id:#x} moved to another view"));
+    }
+    if resolve_handle(entry + ENTRY_NODE_HANDLE)? != node
+        || resolve_handle(view + VIEW_NODE_HANDLE)? != node
+    {
+        return Err("the view's camera node was released".into());
+    }
+    if read_u64(node + NODE_CAMERA)? != camera
+        || read_u16(camera + CAMERA_TYPE)? != CAMERA_TYPE_VALUE
+    {
+        return Err("the view's camera was replaced".into());
+    }
+    Ok(())
 }
 
 fn free_count(renderer: u64) -> Result<usize, String> {
@@ -1014,4 +1352,19 @@ fn read_ladder(view: u64) -> Result<[f32; 4], String> {
 }
 fn read_f64(addr: u64) -> Result<f64, String> {
     Ok(f64::from_le_bytes(read_bytes::<8>(addr)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recreating_backs_off_to_a_ceiling_and_never_stops() {
+        assert_eq!(retry_delay(1), RETRY_FIRST);
+        assert_eq!(retry_delay(2), RETRY_FIRST * 2);
+        assert_eq!(retry_delay(3), RETRY_FIRST * 4);
+        assert_eq!(retry_delay(10), RETRY_MAX);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
+        assert_eq!(retry_delay(0), RETRY_FIRST);
+    }
 }

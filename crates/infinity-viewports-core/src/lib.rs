@@ -11,7 +11,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use std::time::Duration;
 
@@ -33,6 +33,16 @@ use drive::Driver;
 
 static MODULE: AtomicUsize = AtomicUsize::new(0);
 static IN_HOOK: AtomicBool = AtomicBool::new(false);
+/// Teardown handshake between the watcher thread and the update hook: the
+/// view can only be erased on the sim's update, so the watcher asks
+/// ([`RELEASE_ASKED`]) and waits for the hook to answer ([`RELEASE_DONE`]).
+const RELEASE_NONE: u8 = 0;
+const RELEASE_ASKED: u8 = 1;
+const RELEASE_DONE: u8 = 2;
+static RELEASE: AtomicU8 = AtomicU8::new(RELEASE_NONE);
+/// How long the watcher waits for an update to erase the view. The update
+/// runs every frame; a sim stuck this long is not rendering the view either.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
 static LAST_LOG: Mutex<String> = Mutex::new(String::new());
 
@@ -100,6 +110,23 @@ unsafe extern "C" fn nose_on_update(manager: *mut c_void) {
         let Some(driver) = guard.as_mut() else {
             return;
         };
+        if RELEASE.load(Ordering::Acquire) == RELEASE_ASKED {
+            let result = driver.release(manager);
+            if let Some(note) = driver.take_note() {
+                log_changed(&note);
+            }
+            match result {
+                // Another manager's update; ours erases on its own.
+                Ok(false) => return,
+                Ok(true) => {}
+                Err(err) => log_changed(&format!("release: {err}")),
+            }
+            RELEASE.store(RELEASE_DONE, Ordering::Release);
+            return;
+        }
+        if RELEASE.load(Ordering::Acquire) == RELEASE_DONE {
+            return;
+        }
         let before = driver.phase_name();
         let result = driver.step(manager);
         let after = driver.phase_name();
@@ -239,7 +266,17 @@ unsafe extern "system" fn teardown_watcher(_: *mut c_void) -> u32 {
         return 0;
     }
     let _ = unsafe { CloseHandle(event) };
-    log_line("teardown signal received; unhooking");
+    log_line("teardown signal received; erasing the nose view");
+    RELEASE.store(RELEASE_ASKED, Ordering::Release);
+    let deadline = std::time::Instant::now() + RELEASE_WAIT;
+    while RELEASE.load(Ordering::Acquire) != RELEASE_DONE {
+        if std::time::Instant::now() >= deadline {
+            log_line("no update ran to erase the nose view; unhooking without it");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    log_line("unhooking");
     let restored = unhook();
     log_line(&format!(
         "unhook: slot restored={restored}; draining then unloading infinity_viewports_core"

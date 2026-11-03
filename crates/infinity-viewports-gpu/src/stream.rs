@@ -105,17 +105,35 @@ impl StreamState {
 
 static STREAM: Mutex<StreamState> = Mutex::new(StreamState::idle());
 
+/// Read-back rings retired by a size change. Never released: the sim's
+/// command lists copy into them up to [`RING`] frames after recording, with
+/// no fence of ours to say when the GPU is done, and a buffer freed under a
+/// pending copy hangs the device (`DXGI_ERROR_DEVICE_HUNG`). A few MB per
+/// size change, and the bridge leaks its GPU objects at unload for the same
+/// reason.
+static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
 /// Start streaming `width`×`height` into the `VideoBlock` at `video_ptr`.
 /// `video_ptr` must point to a mapped, zero-filled `VideoBlock` that outlives the
 /// stream (owned by the bridge).
+///
+/// A restart at the same size reuses the read-back ring of the last stream.
 pub fn start_stream(video_ptr: usize, width: u32, height: u32) {
     let Ok(mut st) = STREAM.lock() else { return };
+    let mut bufs = std::mem::take(&mut st.bufs);
+    if width != st.w || height != st.h || bufs.len() != RING * NLAYERS {
+        retire(&mut bufs);
+        bufs = (0..RING * NLAYERS).map(|_| None).collect();
+    }
+    let (color_fmt, color_occ) = (st.color_fmt, st.color_occ);
     *st = StreamState::idle();
+    st.color_fmt = color_fmt;
+    st.color_occ = color_occ;
     st.on = true;
     st.video = video_ptr;
     st.w = width;
     st.h = height;
-    st.bufs = (0..RING * NLAYERS).map(|_| None).collect();
+    st.bufs = bufs;
     st.rec = (0..RING * NLAYERS).map(|_| None).collect();
     st.claimed = vec![false; RING * NLAYERS];
     st.frame_of = vec![u64::MAX; RING];
@@ -135,10 +153,26 @@ pub fn start_stream(video_ptr: usize, width: u32, height: u32) {
     }
 }
 
-/// Stop streaming (the bridge then frees the mapping).
+/// Stop streaming. Nothing more is recorded or published; the read-back
+/// ring stays allocated, because copies recorded in the last few frames may
+/// still be in flight on the GPU (see [`RETIRED`]).
 pub fn stop_stream() {
     if let Ok(mut st) = STREAM.lock() {
-        *st = StreamState::idle();
+        st.on = false;
+        st.video = 0;
+        st.rec.iter_mut().for_each(|r| *r = None);
+        st.claimed.iter_mut().for_each(|c| *c = false);
+    }
+}
+
+fn retire(bufs: &mut Vec<Option<ID3D12Resource>>) {
+    let old: Vec<ID3D12Resource> = bufs.drain(..).flatten().collect();
+    if old.is_empty() {
+        return;
+    }
+    match RETIRED.lock() {
+        Ok(mut r) => r.extend(old),
+        Err(_) => old.into_iter().for_each(std::mem::forget),
     }
 }
 
