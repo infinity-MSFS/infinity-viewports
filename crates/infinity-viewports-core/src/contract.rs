@@ -1,21 +1,21 @@
-pub const BUILD_TIMESTAMP: u32 = 0x6AD6_56BB;
+pub const BUILD_TIMESTAMP: u32 = 0x6AE8_C698;
 
-pub const INIT_DESCRIPTOR: u32 = 0x0121_50E0;
-pub const ACTIVATE_ENTRY: u32 = 0x0121_56E0;
-pub const CREATE_ENTRY: u32 = 0x0121_6B30;
-pub const ERASE_ENTRY: u32 = 0x0121_6760;
-pub const SET_POSITION: u32 = 0x0415_32D0;
+pub const INIT_DESCRIPTOR: u32 = 0x0121_50A0;
+pub const ACTIVATE_ENTRY: u32 = 0x0121_56A0;
+pub const CREATE_ENTRY: u32 = 0x0121_6AF0;
+pub const ERASE_ENTRY: u32 = 0x0121_6720;
+pub const SET_POSITION: u32 = 0x0415_3080;
 /// `attach_child(parent, handle, keep_world)` and `detach_node(node, keep_children, keep_world)`.
 /// Recorded for this image. The driver calls them only when the bytes at the
 /// RVA look like a function; otherwise the camera stays on its original parent.
-pub const ATTACH_CHILD: u32 = 0x0414_DCD0;
-pub const DETACH_NODE: u32 = 0x0415_3010;
-pub const SET_UP: u32 = 0x041C_2DA0;
-pub const SET_TARGET: u32 = 0x041C_2D80;
-pub const SET_FOV: u32 = 0x041C_2D50;
-pub const UPDATE_VIEW: u32 = 0x041B_A830;
-pub const REFRESH_OUTPUT: u32 = 0x041B_6BB0;
-pub const MANAGER_UPDATE: u32 = 0x0121_7150;
+pub const ATTACH_CHILD: u32 = 0x0414_DA80;
+pub const DETACH_NODE: u32 = 0x0415_2DC0;
+pub const SET_UP: u32 = 0x041C_2B50;
+pub const SET_TARGET: u32 = 0x041C_2B30;
+pub const SET_FOV: u32 = 0x041C_2B00;
+pub const UPDATE_VIEW: u32 = 0x041B_A5E0;
+pub const REFRESH_OUTPUT: u32 = 0x041B_6960;
+pub const MANAGER_UPDATE: u32 = 0x0121_7110;
 pub const RENDERER_GLOBAL: u32 = 0x0AAC_D510;
 pub const MANAGER_VTABLE: u32 = 0x0832_ED38;
 
@@ -68,7 +68,7 @@ pub const CAMERA_NEAR: u64 = 0x5F0;
 /// Culling far. `update_view` loads it (`movss xmm0, [camera+0x5F4]`).
 pub const CAMERA_FAR: u64 = 0x5F4;
 /// Default far. `update_view` loads it (`movss xmm3, [camera+0x5F8]`).
-/// SetFar at `0x041C2D30` writes this and `CAMERA_FAR` from the same float.
+/// SetFar at `0x041C2AE0` writes this and `CAMERA_FAR` from the same float.
 /// A view created through `create_entry` comes up at 1000 m, which drops the
 /// ground once the slant range exceeds that.
 pub const CAMERA_DEFAULT_FAR: u64 = 0x5F8;

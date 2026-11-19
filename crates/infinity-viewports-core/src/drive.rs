@@ -2,8 +2,9 @@ use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use infinity_viewports_protocol::{
-    APPLIED_FOLLOW, APPLIED_MISSING, APPLIED_PLACED, CameraStatus, ECEF_MATCH_M, EcefMap, MOUNT_AIRCRAFT,
-    NOSE_CREATING, NOSE_LIVE, NOSE_REACQUIRING, NOSE_STOPPED, fit_ecef, pose_populated,
+    APPLIED_FOLLOW, APPLIED_MISSING, APPLIED_PLACED, CameraStatus, ECEF_MATCH_M, EcefMap,
+    MOUNT_AIRCRAFT, NOSE_CREATING, NOSE_LIVE, NOSE_REACQUIRING, NOSE_STOPPED, fit_ecef,
+    pose_populated,
 };
 use infinity_viewports_shim::{
     Faulted, guarded_activate, guarded_call1, guarded_call1_ret, guarded_call2, guarded_call2_ret,
