@@ -17,8 +17,10 @@ impl Capturer {
     /// redirect (`CreateRenderTargetView`, `Reset`, `OMSetRenderTargets`).
     /// Only slot swaps, never byte patches. Returns a description of what was
     /// hooked, or a reason string on failure.
-    pub fn install(&mut self) -> Result<String, String> {
-        let desc = hook::install_present()?;
+    /// Install the hooks. `step` hears each call before it is made (see
+    /// [`hook::install_present`]).
+    pub fn install(&mut self, step: &mut dyn FnMut(&str)) -> Result<String, String> {
+        let desc = hook::install_present(step)?;
         self.installed = hook::is_installed();
         Ok(desc)
     }

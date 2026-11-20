@@ -95,12 +95,10 @@ impl LogFile {
             return;
         }
         let t = self.started.elapsed().as_secs_f64();
-        let mut line = format!("{t:10.3} {:<5} [{tag}] {msg}
-", level_name(level));
+        let mut line = format!("{t:10.3} {:<5} [{tag}] {msg}\r\n", level_name(level));
         self.written += line.len() as u64;
         if self.written >= LOG_FILE_MAX_BYTES {
-            line.push_str("log file size cap reached; further lines go to the manager only
-");
+            line.push_str("log file size cap reached; further lines go to the manager only\r\n");
         }
         let _ = self.file.write_all(line.as_bytes());
     }
@@ -169,7 +167,9 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
     );
 
     let mut capturer = Capturer::new();
-    match capturer.install() {
+    let installed = capturer
+        .install(&mut |step| logger.log(LogLevel::Debug, "gpu", &format!("install: {step}")));
+    match installed {
         Ok(desc) => logger.log(LogLevel::Info, "gpu", &desc),
         Err(e) => logger.log(LogLevel::Error, "gpu", &format!("present hook failed: {e}")),
     }

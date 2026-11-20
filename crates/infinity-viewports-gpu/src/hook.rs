@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -33,16 +33,19 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGISwapChain,
     IDXGISwapChain1,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    GetModuleHandleExW,
+};
 use windows::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UnregisterClassW,
+    WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::GUID;
-use windows::core::{Interface, w};
+use windows::core::{Interface, PCWSTR, w};
 
 /// `IDXGISwapChain::Present` signature.
 type PresentFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> windows::core::HRESULT;
@@ -350,6 +353,17 @@ unsafe extern "system" fn cpr_hook(
     unsafe { orig(this, heap, off, desc, st, cv, riid, ppv) }
 }
 
+/// Whether the command-list hooks have work to do: a stream or a layer scan
+/// is running. The bridge stays in the sim for the sim's lifetime (a second
+/// install into a live sim once hung it), so its hooks run on every barrier,
+/// bind, close and reset of every frame even with the FLIR off. While idle
+/// they forward straight to the original: two atomic loads, no lock.
+/// `crate::stream::start_stream` clears the cloud latch state before this
+/// turns true again, so nothing latched while idle is acted on.
+fn active() -> bool {
+    crate::stream::stream_active() || crate::capture::scan_pending()
+}
+
 /// Our replacement `ResourceBarrier`: for each TRANSITION barrier, read the
 /// transitioned resource and `GetDesc` it once, then call the original.
 /// This catches the persistent HDR/G-buffer/depth targets the creation hooks
@@ -360,8 +374,9 @@ unsafe extern "system" fn rb_hook(
     num: u32,
     barriers: *const D3D12_RESOURCE_BARRIER,
 ) {
-    // Barriers recorded for the post-merge copy must not re-enter the copy.
-    if crate::cloud::copying() {
+    // Barriers recorded for the post-merge copy must not re-enter the copy;
+    // with nothing streaming there is nothing to look at.
+    if crate::cloud::copying() || !active() {
         let orig: ResourceBarrierFn =
             unsafe { core::mem::transmute(RB_ORIGINAL.load(Ordering::Acquire)) };
         unsafe { orig(this, num, barriers) };
@@ -500,7 +515,9 @@ unsafe extern "system" fn crtv_hook(
 /// Our replacement `Close`: the cloud pass has finished drawing. Copy the
 /// redirected colour while the list is still recording, then close.
 unsafe extern "system" fn close_hook(this: *mut c_void) -> windows::core::HRESULT {
-    unsafe { crate::cloud::flush_target(this) };
+    if active() {
+        unsafe { crate::cloud::flush_target(this) };
+    }
     let orig: CloseFn = unsafe { core::mem::transmute(CLOSE_ORIGINAL.load(Ordering::Acquire)) };
     unsafe { orig(this) }
 }
@@ -513,8 +530,10 @@ unsafe extern "system" fn reset_hook(
     alloc: *mut c_void,
     pso: *mut c_void,
 ) -> windows::core::HRESULT {
-    crate::cloud::drop_pending(this);
-    crate::cloud::forget(this);
+    if active() {
+        crate::cloud::drop_pending(this);
+        crate::cloud::forget(this);
+    }
     let orig: ResetFn = unsafe { core::mem::transmute(RESET_ORIGINAL.load(Ordering::Acquire)) };
     unsafe { orig(this, alloc, pso) }
 }
@@ -529,6 +548,10 @@ unsafe extern "system" fn om_hook(
     depth: *const D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let orig: OmSetFn = unsafe { core::mem::transmute(OM_ORIGINAL.load(Ordering::Acquire)) };
+    if !active() {
+        unsafe { orig(this, count, handles, single, depth) };
+        return;
+    }
     unsafe { crate::cloud::on_om(this, count, handles, single, depth, orig) };
 }
 
@@ -667,12 +690,17 @@ pub fn uninstall_present() -> String {
 
 /// Install the D3D12/DXGI vtable hooks (`Present` + `ExecuteCommandLists`).
 /// Idempotent. Returns a description on success, or a reason string on failure.
-pub fn install_present() -> Result<String, String> {
+///
+/// `step` is called with a short label BEFORE each OS/D3D call that could
+/// block, so a log written from it names the call a hung install is stuck in
+/// (a second install into a live sim once never returned, and the only line
+/// logged was the one before it).
+pub fn install_present(step: &mut dyn FnMut(&str)) -> Result<String, String> {
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Ok("hooks already installed".into());
     }
     // On any failure, allow a later retry.
-    match unsafe { install_inner() } {
+    match unsafe { install_inner(step) } {
         Ok(s) => Ok(s),
         Err(e) => {
             // A partial swap must be undone. Retrying on top of our own hook
@@ -684,11 +712,23 @@ pub fn install_present() -> Result<String, String> {
     }
 }
 
-unsafe fn install_inner() -> Result<String, String> {
+unsafe fn install_inner(step: &mut dyn FnMut(&str)) -> Result<String, String> {
     unsafe {
-        let hinst: HINSTANCE = GetModuleHandleW(None)
-            .map_err(|e| format!("GetModuleHandleW: {e}"))?
-            .into();
+        // The window class belongs to THIS DLL, not the sim's exe, and is
+        // unregistered before returning (`WindowGuard`). Registered under the
+        // exe it outlived the bridge that registered it, so a later bridge's
+        // RegisterClassW failed quietly and CreateWindowExW used the old
+        // class, whose window procedure could point into the unloaded DLL.
+        // (A suspect for the hung second install, not a proven cause.)
+        step("module handle");
+        let mut module = HMODULE::default();
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(wndproc as *const () as *const u16),
+            &mut module,
+        )
+        .map_err(|e| format!("GetModuleHandleExW: {e}"))?;
+        let hinst: HINSTANCE = module.into();
 
         // Minimal hidden window to back the dummy swap chain.
         let class = w!("InfinityViewportsDummyWnd");
@@ -698,8 +738,15 @@ unsafe fn install_inner() -> Result<String, String> {
             lpszClassName: class,
             ..Default::default()
         };
-        RegisterClassW(&wc); // harmless if already registered
-        let hwnd = CreateWindowExW(
+        step("register window class");
+        // A class left by a crashed earlier attempt of THIS module is ours
+        // too; drop it so the registration below is the live one.
+        let _ = UnregisterClassW(class, Some(hinst));
+        if RegisterClassW(&wc) == 0 {
+            return Err("RegisterClassW failed".into());
+        }
+        step("create window");
+        let created = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             w!("infinity-viewports"),
@@ -712,11 +759,18 @@ unsafe fn install_inner() -> Result<String, String> {
             None,
             Some(hinst),
             None,
-        )
-        .map_err(|e| format!("CreateWindowExW: {e}"))?;
-        let _wnd = WindowGuard(hwnd);
+        );
+        let hwnd = match created {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = UnregisterClassW(class, Some(hinst));
+                return Err(format!("CreateWindowExW: {e}"));
+            }
+        };
+        let _wnd = WindowGuard { hwnd, class, hinst };
 
         // Dummy device + direct queue.
+        step("D3D12CreateDevice");
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device)
             .map_err(|e| format!("D3D12CreateDevice: {e}"))?;
@@ -725,11 +779,13 @@ unsafe fn install_inner() -> Result<String, String> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         };
+        step("CreateCommandQueue");
         let queue: ID3D12CommandQueue = device
             .CreateCommandQueue(&qdesc)
             .map_err(|e| format!("CreateCommandQueue: {e}"))?;
 
         // Dummy flip swap chain on that queue.
+        step("CreateDXGIFactory2");
         let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
             .map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
         let scdesc = DXGI_SWAP_CHAIN_DESC1 {
@@ -745,10 +801,12 @@ unsafe fn install_inner() -> Result<String, String> {
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             ..Default::default()
         };
+        step("CreateSwapChainForHwnd");
         let swap: IDXGISwapChain1 = factory
             .CreateSwapChainForHwnd(&queue, hwnd, &scdesc, None, None)
             .map_err(|e| format!("CreateSwapChainForHwnd: {e}"))?;
 
+        step("swap vtable slots");
         // Swap IDXGISwapChain::Present (slot 8).
         let present_vtbl = *(swap.as_raw() as *const *mut usize);
         let (present_entry, present_orig) = swap_slot(
@@ -778,6 +836,7 @@ unsafe fn install_inner() -> Result<String, String> {
 
         // Dummy command list, to get the ID3D12GraphicsCommandList vtable, and
         // swap ResourceBarrier (slot 26).
+        step("CreateCommandList");
         let alloc: ID3D12CommandAllocator = device
             .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
             .map_err(|e| format!("CreateCommandAllocator: {e}"))?;
@@ -793,6 +852,7 @@ unsafe fn install_inner() -> Result<String, String> {
         RB_ENTRY.store(rb_entry, Ordering::Release);
         RB_ORIGINAL.store(rb_orig, Ordering::Release);
 
+        step("swap cloud-redirect slots");
         // Nose cloud redirect. These three sit on the same vtables as the slots
         // above, so a sim that already calls ResourceBarrier / CreateCommittedResource
         // calls these too.
@@ -821,13 +881,19 @@ unsafe fn install_inner() -> Result<String, String> {
     }
 }
 
-struct WindowGuard(HWND);
+/// The dummy window and its class: destroyed, then unregistered, on drop.
+struct WindowGuard {
+    hwnd: HWND,
+    class: PCWSTR,
+    hinst: HINSTANCE,
+}
 impl Drop for WindowGuard {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = DestroyWindow(self.0);
+        unsafe {
+            if !self.hwnd.is_invalid() {
+                let _ = DestroyWindow(self.hwnd);
             }
+            let _ = UnregisterClassW(self.class, Some(self.hinst));
         }
     }
 }

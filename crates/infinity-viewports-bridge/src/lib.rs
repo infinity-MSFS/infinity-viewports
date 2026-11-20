@@ -32,7 +32,9 @@ pub(crate) fn module_path() -> Option<std::path::PathBuf> {
     let mut buf = [0u16; 1024];
     let n = unsafe { GetModuleFileNameW(Some(HMODULE(module as *mut c_void)), &mut buf) };
     let wide = buf.get(..n as usize).filter(|w| !w.is_empty())?;
-    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(wide)))
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        wide,
+    )))
 }
 
 /// Unload the bridge DLL and exit the calling (service) thread. Never returns.

@@ -230,6 +230,16 @@ fn note_rtv(device: *mut std::ffi::c_void, handle: usize, view: View) {
     views.insert(handle, view);
 }
 
+/// Forget every command list's latch and pending copy. Called before the
+/// hooks wake from idle: they did not see the resets in between, so any
+/// state still here belongs to recordings that no longer exist.
+pub fn reset_lists() {
+    if let Ok(mut lists) = LISTS.lock() {
+        lists.clear();
+    }
+    LATCHED.store(0, Ordering::Relaxed);
+}
+
 /// Drop a command list's latched scene colour. A barrier or reset between the
 /// scene bind and the merge means that colour is no longer the bound target.
 pub fn forget(list: *mut std::ffi::c_void) {

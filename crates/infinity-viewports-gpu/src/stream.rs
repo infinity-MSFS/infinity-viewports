@@ -16,7 +16,7 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -104,6 +104,9 @@ impl StreamState {
 }
 
 static STREAM: Mutex<StreamState> = Mutex::new(StreamState::idle());
+/// `STREAM.on`, readable without the lock: the hooks test it on every call
+/// (`crate::hook`'s idle gate), from every render thread.
+static STREAM_ON: AtomicBool = AtomicBool::new(false);
 
 /// Read-back rings retired by a size change. Never released: the sim's
 /// command lists copy into them up to [`RING`] frames after recording, with
@@ -119,6 +122,10 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 ///
 /// A restart at the same size reuses the read-back ring of the last stream.
 pub fn start_stream(video_ptr: usize, width: u32, height: u32) {
+    // Latches left from before an idle spell describe command lists that
+    // have since been reset without the hooks watching: drop them before
+    // the hooks wake up.
+    crate::cloud::reset_lists();
     let Ok(mut st) = STREAM.lock() else { return };
     let mut bufs = std::mem::take(&mut st.bufs);
     if width != st.w || height != st.h || bufs.len() != RING * NLAYERS {
@@ -151,6 +158,8 @@ pub fn start_stream(video_ptr: usize, width: u32, height: u32) {
             vb.header.seq.store(0, Ordering::Release);
         }
     }
+    // Last, with the state complete: this is what wakes the hooks.
+    STREAM_ON.store(true, Ordering::Release);
 }
 
 /// Stop streaming. Nothing more is recorded or published; the read-back
@@ -159,6 +168,7 @@ pub fn start_stream(video_ptr: usize, width: u32, height: u32) {
 pub fn stop_stream() {
     if let Ok(mut st) = STREAM.lock() {
         st.on = false;
+        STREAM_ON.store(false, Ordering::Release);
         st.video = 0;
         st.rec.iter_mut().for_each(|r| *r = None);
         st.claimed.iter_mut().for_each(|c| *c = false);
@@ -186,7 +196,7 @@ pub fn set_color_source(format: u32, occurrence: u32) {
 
 /// Whether streaming is active (cheap gate for the barrier hook).
 pub fn stream_active() -> bool {
-    STREAM.lock().map(|s| s.on).unwrap_or(false)
+    STREAM_ON.load(Ordering::Acquire)
 }
 
 /// Published frame count (diagnostics).
