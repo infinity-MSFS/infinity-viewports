@@ -75,6 +75,18 @@ const RESET_SLOT: usize = 10;
 /// `ID3D12GraphicsCommandList::OMSetRenderTargets` (SOSetTargets is 45, this is 46).
 const OM_SLOT: usize = 46;
 
+/// Capture candidates noted per `ResourceBarrier` call; the stream wants two
+/// layers a frame, so a batch with more readable transitions than this only
+/// defers the rest to a later barrier.
+const MAX_CAPTURES_PER_CALL: usize = 16;
+/// `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE`.
+const SRV_STATES: u32 = 0x40 | 0x80;
+/// `D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY`: a split barrier's first half —
+/// the resource is NOT in `StateAfter` until the matching END_ONLY.
+const BARRIER_FLAG_BEGIN_ONLY: u32 = 0x1;
+/// `D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES`.
+const ALL_SUBRESOURCES: u32 = 0xFFFF_FFFF;
+
 /// `ID3D12GraphicsCommandList::ResourceBarrier` signature.
 type ResourceBarrierFn = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER);
 /// `ID3D12Device::CreateRenderTargetView` signature. The destination handle is passed by value.
@@ -339,9 +351,10 @@ unsafe extern "system" fn cpr_hook(
 }
 
 /// Our replacement `ResourceBarrier`: for each TRANSITION barrier, read the
-/// transitioned resource and `GetDesc` it once, then tail-call the original.
+/// transitioned resource and `GetDesc` it once, then call the original.
 /// This catches the persistent HDR/G-buffer/depth targets the creation hooks
-/// miss (they were allocated before injection). Read-only; forwards everything.
+/// miss (they were allocated before injection). Forwards everything unchanged;
+/// capture copies are recorded AFTER the original, never before it.
 unsafe extern "system" fn rb_hook(
     this: *mut c_void,
     num: u32,
@@ -360,6 +373,11 @@ unsafe extern "system" fn rb_hook(
     crate::cloud::forget(this);
     RB_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut pass_ended: Option<u32> = None;
+    let scan_pending = crate::capture::scan_pending();
+    let stream_active = crate::stream::stream_active();
+    // (resource, subresource, state_after) to copy once the original has run.
+    let mut pending = [(0usize, 0u32, 0u32); MAX_CAPTURES_PER_CALL];
+    let mut pending_n = 0usize;
     if !barriers.is_null() && num > 0 && num < 4096 {
         for i in 0..num as usize {
             let b = unsafe { barriers.add(i) };
@@ -399,29 +417,20 @@ unsafe extern "system" fn rb_hook(
                 }
             }
 
-            // Capture: when a layer scan or the live stream is active, look for
-            // resources transitioning to a shader-readable state and record a
-            // copy into this (the sim's) command list. One GetDesc serves both.
-            let scan_pending = crate::capture::scan_pending();
-            let stream_active = crate::stream::stream_active();
-            if scan_pending || stream_active {
+            // Capture candidates: resources this call COMPLETES a transition
+            // of into a shader-readable state. Only noted here — the copy is
+            // recorded after the original barrier (below), see `capture_ok`.
+            if (scan_pending || stream_active) && pending_n < MAX_CAPTURES_PER_CALL {
+                let flags = unsafe { *((b as *const u8).add(4) as *const u32) };
+                let subresource = unsafe { *((b as *const u8).add(16) as *const u32) };
                 let state_after = unsafe { *((b as *const u8).add(24) as *const u32) };
-                let readable = state_after & 0xC0 != 0; // PIXEL(0x80)|NON_PIXEL(0x40) shader resource
-                if readable {
-                    let raw = res_ptr as *mut c_void;
-                    if let Some(res) = unsafe { ID3D12Resource::from_raw_borrowed(&raw) } {
-                        let d = unsafe { res.GetDesc() };
-                        if scan_pending {
-                            unsafe {
-                                crate::capture::record_scan_layer(this, res, &d, state_after)
-                            };
-                        }
-                        if stream_active {
-                            unsafe {
-                                crate::stream::record_stream_layer(this, res, &d, state_after)
-                            };
-                        }
-                    }
+                let readable = state_after & SRV_STATES != 0;
+                if readable
+                    && flags & BARRIER_FLAG_BEGIN_ONLY == 0
+                    && let Some(slot) = pending.get_mut(pending_n)
+                {
+                    *slot = (res_ptr, subresource, state_after);
+                    pending_n += 1;
                 }
             }
         }
@@ -431,7 +440,44 @@ unsafe extern "system" fn rb_hook(
     }
     let orig: ResourceBarrierFn =
         unsafe { core::mem::transmute(RB_ORIGINAL.load(Ordering::Acquire)) };
-    unsafe { orig(this, num, barriers) }
+    unsafe { orig(this, num, barriers) };
+
+    // Record the copies AFTER the sim's barrier, so each resource really is in
+    // `state_after` when our `state_after -> COPY_SOURCE` transition runs.
+    // Recording them before it (as this hook once did) told the driver the
+    // resource was already shader-readable while it was still a render target:
+    // no decompress / cache flush before the copy. NVIDIA hung the device
+    // (DXGI_ERROR_DEVICE_HUNG) and AMD copied compressed garbage (the FLIR read
+    // white) the moment the stream started.
+    for &(res_ptr, subresource, state_after) in pending.iter().take(pending_n) {
+        let raw = res_ptr as *mut c_void;
+        let Some(res) = (unsafe { ID3D12Resource::from_raw_borrowed(&raw) }) else {
+            continue;
+        };
+        let d = unsafe { res.GetDesc() };
+        if !capture_ok(&d, subresource) {
+            continue;
+        }
+        if scan_pending {
+            unsafe { crate::capture::record_scan_layer(this, res, &d, state_after) };
+        }
+        if stream_active {
+            unsafe { crate::stream::record_stream_layer(this, res, &d, state_after) };
+        }
+    }
+}
+
+/// The copy helpers transition `ALL_SUBRESOURCES` and copy subresource 0, so a
+/// barrier is only safe to piggy-back on when it moved the whole resource: a
+/// barrier naming every subresource, or subresource 0 of a texture that has
+/// no other (one mip, one slice, and not a depth-stencil, whose stencil is a
+/// second plane).
+fn capture_ok(d: &D3D12_RESOURCE_DESC, subresource: u32) -> bool {
+    if subresource == ALL_SUBRESOURCES {
+        return true;
+    }
+    let depth_stencil = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+    subresource == 0 && d.MipLevels <= 1 && d.DepthOrArraySize <= 1 && !depth_stencil
 }
 
 /// Our replacement `CreateRenderTargetView`: create the view, then remember it

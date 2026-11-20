@@ -20,6 +20,21 @@ static STARTING: AtomicBool = AtomicBool::new(false);
 /// unload the bridge cleanly on a teardown command.
 static MODULE: AtomicUsize = AtomicUsize::new(0);
 
+/// This DLL's own path on disk (the manager injects a per-build copy, so its
+/// folder is that build's), or `None` before `DllMain` has run.
+pub(crate) fn module_path() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    let module = MODULE.load(Ordering::Acquire);
+    if module == 0 {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(Some(HMODULE(module as *mut c_void)), &mut buf) };
+    let wide = buf.get(..n as usize).filter(|w| !w.is_empty())?;
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(wide)))
+}
+
 /// Unload the bridge DLL and exit the calling (service) thread. Never returns.
 /// The caller must have already uninstalled the hooks and drained in-flight
 /// hook calls, so no sim thread is executing in this module's code.

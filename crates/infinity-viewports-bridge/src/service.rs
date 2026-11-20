@@ -51,14 +51,84 @@ impl Bridge {
     }
 }
 
-/// Appends structured records to the bridge→host log ring with a monotonic seq.
+/// The bridge's own log file, beside the DLL. The previous session's is kept
+/// as [`LOG_FILE_PREV`], so relaunching after a crash does not wipe the log a
+/// tester was about to send.
+const LOG_FILE: &str = "infinity_viewports_bridge.log";
+const LOG_FILE_PREV: &str = "infinity_viewports_bridge.prev.log";
+/// The file stops growing here (one line says so); the ring to the manager
+/// carries on regardless.
+const LOG_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A plain append-only file, written unbuffered from the service thread (never
+/// a sim thread), so every line is with the OS the moment it is logged and
+/// survives the sim dying on the next instruction — DXGI_ERROR_DEVICE_HUNG
+/// being the case this exists for.
+struct LogFile {
+    file: std::fs::File,
+    written: u64,
+    started: Instant,
+}
+
+impl LogFile {
+    fn open() -> Option<LogFile> {
+        let dll = crate::module_path()?;
+        let dir = dll.parent()?;
+        let path = dir.join(LOG_FILE);
+        let _ = std::fs::rename(&path, dir.join(LOG_FILE_PREV));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        Some(LogFile {
+            file,
+            written: 0,
+            started: Instant::now(),
+        })
+    }
+
+    fn write(&mut self, level: LogLevel, tag: &str, msg: &str) {
+        use std::io::Write;
+        if self.written >= LOG_FILE_MAX_BYTES {
+            return;
+        }
+        let t = self.started.elapsed().as_secs_f64();
+        let mut line = format!("{t:10.3} {:<5} [{tag}] {msg}
+", level_name(level));
+        self.written += line.len() as u64;
+        if self.written >= LOG_FILE_MAX_BYTES {
+            line.push_str("log file size cap reached; further lines go to the manager only
+");
+        }
+        let _ = self.file.write_all(line.as_bytes());
+    }
+}
+
+fn level_name(level: LogLevel) -> &'static str {
+    match level as u8 {
+        0 => "TRACE",
+        1 => "DEBUG",
+        2 => "INFO",
+        3 => "WARN",
+        _ => "ERROR",
+    }
+}
+
+/// Appends structured records to the bridge→host log ring with a monotonic
+/// seq, and to [`LogFile`] when it could be opened.
 struct Logger {
     block: *const SharedBlock,
     seq: u64,
+    file: Option<LogFile>,
 }
 
 impl Logger {
     fn log(&mut self, level: LogLevel, tag: &str, msg: &str) {
+        if let Some(f) = self.file.as_mut() {
+            f.write(level, tag, msg);
+        }
         let mut rec = LogRecord::EMPTY;
         rec.seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
@@ -78,7 +148,11 @@ impl Logger {
 fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
     // SAFETY: `ptr` is the leaked, process-lifetime mapping created in `start`.
     let block = unsafe { &*ptr };
-    let mut logger = Logger { block: ptr, seq: 0 };
+    let mut logger = Logger {
+        block: ptr,
+        seq: 0,
+        file: LogFile::open(),
+    };
 
     // Initial status before publishing the header (no reader yet).
     let mut status = StatusSnapshot::ZERO;
