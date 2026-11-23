@@ -396,6 +396,9 @@ unsafe extern "system" fn rb_hook(
             continue;
         };
         let d = unsafe { res.GetDesc() };
+        if stream_active {
+            crate::stream::note_candidate(&d);
+        }
         if !capture_ok(&d, subresource) {
             continue;
         }

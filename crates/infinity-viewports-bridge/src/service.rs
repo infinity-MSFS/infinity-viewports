@@ -174,6 +174,8 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
         Err(e) => logger.log(LogLevel::Error, "gpu", &format!("hook install failed: {e}")),
     }
     let mut last_inv_len = 0usize;
+    // Frame ticks at the last heartbeat, for the starved-stream report.
+    let mut last_ticked = 0u64;
     // Live video stream: the on-demand video mapping, created on first
     // `stream:start` and cached (process-lifetime) for reuse.
     let mut video_ptr: Option<usize> = None;
@@ -278,6 +280,28 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
                     c.tracked, c.om_calls, c.scene_binds, c.shaped, c.merges, c.redirects, c.refusals, c.posted, c.misses
                 ),
             );
+            // A stream that is on and has ticked nothing since the last
+            // heartbeat is STARVED: no layer of its size and formats went
+            // readable. Say what did, so the log names the sizes the sim is
+            // rendering instead (DLSS render scaling, 23 Nov 2026).
+            let ticked = capturer.frames_ticked();
+            let candidates = capturer.take_stream_candidates();
+            if capturer.stream_active() && ticked == last_ticked {
+                let seen: Vec<String> = candidates
+                    .iter()
+                    .take(48)
+                    .map(|c| format!("{}x{} f{} x{}", c.width, c.height, c.format, c.count))
+                    .collect();
+                logger.log(
+                    LogLevel::Warn,
+                    "gpu",
+                    &format!(
+                        "stream STARVED (wants 1024x576 depth f41 + colour); made readable since the last heartbeat: {}",
+                        if seen.is_empty() { "nothing".to_string() } else { seen.join(", ") }
+                    ),
+                );
+            }
+            last_ticked = ticked;
             // Re-log the RT inventory whenever it has grown (e.g. after the user
             // changes resolution, forcing MSFS to reallocate its targets).
             let inv = capturer.rt_inventory();

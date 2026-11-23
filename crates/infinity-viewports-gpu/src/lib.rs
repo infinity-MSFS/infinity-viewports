@@ -44,6 +44,13 @@ impl Capturer {
         capture::frames_ticked()
     }
 
+    /// What the sim made shader-readable since the last call while the
+    /// stream ran, busiest first: the diagnosis for a stream that ticks no
+    /// frames. See [`stream::note_candidate`].
+    pub fn take_stream_candidates(&self) -> Vec<stream::Candidate> {
+        stream::take_candidates()
+    }
+
     /// The service thread's turn to pace a layer scan when no stream is
     /// running. Call every service loop; see [`capture::idle_tick`].
     pub fn idle_tick(&self) {

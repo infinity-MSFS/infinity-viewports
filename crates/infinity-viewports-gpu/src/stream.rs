@@ -195,6 +195,59 @@ pub fn set_color_source(format: u32, occurrence: u32) {
     }
 }
 
+/// One kind of texture the sim made shader-readable while the stream ran:
+/// what a starved stream had to choose from.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    /// Readable transitions since the last [`take_candidates`].
+    pub count: u64,
+}
+
+/// Distinct candidate kinds kept between reports.
+const MAX_CANDIDATES: usize = 128;
+static CANDIDATES: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
+
+/// Count one readable transition of a texture like `desc`. Called from the
+/// barrier hook for every candidate while the stream is on, matched or not.
+/// Never blocks a render thread: a contended lock drops the sample.
+///
+/// This exists because the stream only takes layers of exactly its own size
+/// and formats, and says nothing when none arrive. With DLSS on, the sim
+/// stopped making any 1024x576 depth readable (23 Nov 2026) and the picture
+/// just went clear; this is what names the sizes it rendered instead.
+pub fn note_candidate(desc: &D3D12_RESOURCE_DESC) {
+    let (width, height, format) = (desc.Width as u32, desc.Height, desc.Format.0 as u32);
+    let Ok(mut seen) = CANDIDATES.try_lock() else {
+        return;
+    };
+    if let Some(c) = seen
+        .iter_mut()
+        .find(|c| c.width == width && c.height == height && c.format == format)
+    {
+        c.count += 1;
+    } else if seen.len() < MAX_CANDIDATES {
+        seen.push(Candidate {
+            width,
+            height,
+            format,
+            count: 1,
+        });
+    }
+}
+
+/// The candidates counted since the last call, busiest first, and reset.
+pub fn take_candidates() -> Vec<Candidate> {
+    let mut out = CANDIDATES
+        .lock()
+        .map(|mut seen| std::mem::take(&mut *seen))
+        .unwrap_or_default();
+    out.sort_by_key(|c| core::cmp::Reverse(c.count));
+    out
+}
+
 /// Whether streaming is active (cheap gate for the barrier hook).
 pub fn stream_active() -> bool {
     STREAM_ON.load(Ordering::Acquire)
