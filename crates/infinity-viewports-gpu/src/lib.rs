@@ -13,14 +13,14 @@ impl Capturer {
         Capturer { installed: false }
     }
 
-    /// Install the D3D12/DXGI vtable-slot hooks, including the cloud-merge
+    /// Install the D3D12 vtable-slot hooks, including the cloud-merge
     /// redirect (`CreateRenderTargetView`, `Reset`, `OMSetRenderTargets`).
-    /// Only slot swaps, never byte patches. Returns a description of what was
-    /// hooked, or a reason string on failure.
-    /// Install the hooks. `step` hears each call before it is made (see
-    /// [`hook::install_present`]).
+    /// Only slot swaps, never byte patches, and no DXGI object is created
+    /// (`hook`'s header). Returns a description of what was hooked, or a
+    /// reason string on failure. `step` hears each call before it is made
+    /// (see [`hook::install_hooks`]).
     pub fn install(&mut self, step: &mut dyn FnMut(&str)) -> Result<String, String> {
-        let desc = hook::install_present(step)?;
+        let desc = hook::install_hooks(step)?;
         self.installed = hook::is_installed();
         Ok(desc)
     }
@@ -30,18 +30,24 @@ impl Capturer {
     }
 
     /// Restore every hooked vtable slot to the sim's originals and mark the hooks
-    /// uninstalled. Call `stop_stream` first; drain a few presents before
+    /// uninstalled. Call `stop_stream` first; drain a few frames before
     /// unloading the module. Reinstallable afterwards via `install`.
     pub fn uninstall(&mut self) -> String {
-        let desc = hook::uninstall_present();
+        let desc = hook::uninstall_hooks();
         self.installed = hook::is_installed();
         desc
     }
 
-    /// What the `Present` hook has observed (present count, backbuffer size and
-    /// format). Zeroed until the sim presents its first frame after the hook.
-    pub fn observed(&self) -> hook::Observed {
-        hook::observed()
+    /// Frame ticks so far: nose frames the stream has completed, plus the
+    /// service thread's ticks during a scan (diagnostics).
+    pub fn frames_ticked(&self) -> u64 {
+        capture::frames_ticked()
+    }
+
+    /// The service thread's turn to pace a layer scan when no stream is
+    /// running. Call every service loop; see [`capture::idle_tick`].
+    pub fn idle_tick(&self) {
+        capture::idle_tick();
     }
 
     /// The distinct render-target / depth-stencil resources seen at creation or

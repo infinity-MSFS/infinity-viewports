@@ -4,9 +4,10 @@
 //! layers (depth + a selected colour RT) **every frame** and publishes them to
 //! the host through the [`VideoBlock`] shared mapping. The copies are injected
 //! into the sim's own command lists at the barrier where each resource becomes
-//! shader-readable (same mechanism as the scan), read back a few presents
+//! shader-readable (same mechanism as the scan), read back a few frames
 //! later once the sim's GPU has executed them, then written into the mapping's
-//! triple-buffered seqlock.
+//! triple-buffered seqlock. The stream marks its own frames (`slot_complete`):
+//! nothing here hooks `Present`.
 //!
 //! Lock discipline matches [`crate::capture::record_scan_layer`]: the global
 //! mutex is held only to claim a layer and to store its result, never across a
@@ -35,7 +36,7 @@ use crate::capture::{barrier, create_readback_buffer};
 /// Ring depth — must exceed the read-back latency so the slot being read is
 /// never the slot being recorded.
 const RING: usize = 4;
-/// Presents to wait after recording before the sim's GPU has executed the copy.
+/// Frame ticks to wait after recording before the sim's GPU has executed the copy.
 const LATENCY: u64 = 3;
 /// Layer indices within a slot.
 const L_DEPTH: usize = 0;
@@ -270,21 +271,48 @@ pub unsafe fn record_stream_layer(
     };
 
     // Phase 3 — store the result (or release the claim).
-    let Ok(mut st) = STREAM.lock() else { return };
-    // The round may have rotated while we recorded; only store if still current.
-    if st.cur != slot {
-        st.claimed[idx] = false;
-        return;
-    }
-    match result {
-        Ok((buf, meta)) => {
-            st.bufs[idx] = Some(buf);
-            st.rec[idx] = Some(meta);
-        }
-        Err(_) => {
+    let complete = {
+        let Ok(mut st) = STREAM.lock() else { return };
+        // The round may have rotated while we recorded; only store if still current.
+        if st.cur != slot {
             st.claimed[idx] = false;
+            return;
         }
+        match result {
+            Ok((buf, meta)) => {
+                st.bufs[idx] = Some(buf);
+                st.rec[idx] = Some(meta);
+                slot_complete(&st, slot)
+            }
+            Err(_) => {
+                st.claimed[idx] = false;
+                false
+            }
+        }
+    };
+    // Lock released: the tick takes it again.
+    if complete {
+        crate::capture::tick();
     }
+}
+
+/// Whether `slot` holds every layer: a finished nose frame. This is the
+/// stream's frame boundary, in place of the `Present` hook that used to mark
+/// it (`crate::hook`'s header): the copy that fills a slot ticks, the tick
+/// rotates the ring, and the next frame's layers land in a fresh slot.
+///
+/// Consequences worth knowing: a slot that never fills (a colour source that
+/// matches nothing) never rotates, which publishes nothing, as before; a
+/// layer that goes readable again later in the same frame is taken as the
+/// next slot's, so that layer then runs one frame behind the other; and
+/// `color_occ` counts occurrences since the last filled slot, not since the
+/// last present, so only occurrence 0 is exact off the cloud-merge path.
+fn slot_complete(st: &StreamState, slot: usize) -> bool {
+    (0..NLAYERS).all(|li| {
+        st.rec
+            .get(slot * NLAYERS + li)
+            .is_some_and(|rec| rec.is_some())
+    })
 }
 
 /// Record a copy of `resource` into `cmdlist`, reusing `existing` readback buffer
@@ -418,39 +446,46 @@ pub unsafe fn record_merged_color(
             ROLE_COLOR,
         )
     };
-    let Ok(mut st) = STREAM.lock() else {
-        return false;
-    };
-    let idx = slot * NLAYERS + L_COLOR;
-    if st.cur != slot {
-        if idx < st.claimed.len() {
-            st.claimed[idx] = false;
-        }
-        return false;
-    }
-    match result {
-        Ok((buf, meta)) => {
-            if idx < st.bufs.len() {
-                st.bufs[idx] = Some(buf);
-                st.rec[idx] = Some(meta);
-                st.claimed[idx] = false;
-                true
-            } else {
-                false
-            }
-        }
-        Err(_) => {
+    let (stored, complete) = {
+        let Ok(mut st) = STREAM.lock() else {
+            return false;
+        };
+        let idx = slot * NLAYERS + L_COLOR;
+        if st.cur != slot {
             if idx < st.claimed.len() {
                 st.claimed[idx] = false;
             }
-            false
+            return false;
         }
+        match result {
+            Ok((buf, meta)) => {
+                if idx < st.bufs.len() {
+                    st.bufs[idx] = Some(buf);
+                    st.rec[idx] = Some(meta);
+                    st.claimed[idx] = false;
+                    (true, slot_complete(&st, slot))
+                } else {
+                    (false, false)
+                }
+            }
+            Err(_) => {
+                if idx < st.claimed.len() {
+                    st.claimed[idx] = false;
+                }
+                (false, false)
+            }
+        }
+    };
+    // Lock released: the tick takes it again. See `slot_complete`.
+    if complete {
+        crate::capture::tick();
     }
+    stored
 }
 
-/// Called once per present (from `capture::tick`). Reads back the slot recorded
-/// `LATENCY` frames ago, publishes it to the mapping, then rotates the ring to a
-/// fresh slot for the next frame's barriers.
+/// Called once per frame tick (from `capture::tick`). Reads back the slot
+/// recorded `LATENCY` frames ago, publishes it to the mapping, then rotates the
+/// ring to a fresh slot for the next frame's barriers.
 pub unsafe fn stream_tick(frame: u64) {
     // Snapshot what to publish under the lock, then do the heavy map/copy after
     // releasing it so barrier-hook threads are never blocked on the copy.

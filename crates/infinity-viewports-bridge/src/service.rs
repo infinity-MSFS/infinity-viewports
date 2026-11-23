@@ -171,9 +171,8 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
         .install(&mut |step| logger.log(LogLevel::Debug, "gpu", &format!("install: {step}")));
     match installed {
         Ok(desc) => logger.log(LogLevel::Info, "gpu", &desc),
-        Err(e) => logger.log(LogLevel::Error, "gpu", &format!("present hook failed: {e}")),
+        Err(e) => logger.log(LogLevel::Error, "gpu", &format!("hook install failed: {e}")),
     }
-    let mut present_logged = false;
     let mut last_inv_len = 0usize;
     // Live video stream: the on-demand video mapping, created on first
     // `stream:start` and cached (process-lifetime) for reuse.
@@ -255,30 +254,21 @@ fn service_loop(ptr: *mut SharedBlock, pid: u32, shutdown: Arc<AtomicBool>) {
             }
         }
 
-        // 1b. Report the GPU foothold once the sim presents its first frame,
-        //     then a periodic heartbeat of the command-stream counters so the
-        //     command-queue hook is visibly firing.
-        if !present_logged {
-            let o = capturer.observed();
-            if o.present_count > 0 && o.backbuffer_w > 0 {
-                logger.log(
-                    LogLevel::Info,
-                    "gpu",
-                    &format!(
-                        "Present hook live: backbuffer {}x{} dxgi_format={} after {} presents",
-                        o.backbuffer_w, o.backbuffer_h, o.backbuffer_format, o.present_count
-                    ),
-                );
-                present_logged = true;
-            }
-        } else if heartbeat % 300 == 0 {
-            let o = capturer.observed();
-            let per_frame = if o.present_count > 0 {
-                o.ecl_lists as f64 / o.present_count as f64
-            } else {
-                0.0
-            };
-            logger.log(LogLevel::Debug, "gpu", &format!("stream: {} presents, {} ECL calls, {} lists (~{:.1}/frame), {} ResourceBarrier calls", o.present_count, o.ecl_submits, o.ecl_lists, per_frame, capturer.resource_barrier_calls()));
+        // 1b. Pace a layer scan when no stream is running to pace it (there
+        //     is no Present hook: `infinity_viewports_gpu::hook`'s header),
+        //     then a periodic heartbeat of the hook counters so the
+        //     command-list hooks are visibly firing.
+        capturer.idle_tick();
+        if heartbeat % 300 == 0 && capturer.is_installed() {
+            logger.log(
+                LogLevel::Debug,
+                "gpu",
+                &format!(
+                    "stream: {} frames ticked, {} ResourceBarrier calls",
+                    capturer.frames_ticked(),
+                    capturer.resource_barrier_calls()
+                ),
+            );
             let c = infinity_viewports_gpu::cloud::stats();
             logger.log(
                 LogLevel::Debug,

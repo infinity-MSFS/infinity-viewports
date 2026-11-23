@@ -12,7 +12,8 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
@@ -221,9 +222,65 @@ unsafe fn record_layer_inner(
     }
 }
 
-/// Called once per present: advance the frame counter, drive the live stream,
-/// and finish a layer scan once its copies have executed.
+/// One tick at a time: a tick maps read-back buffers and writes the video
+/// mapping, which has a single writer.
+static TICKING: AtomicBool = AtomicBool::new(false);
+/// When [`idle_tick`] last ticked.
+static LAST_IDLE_TICK: Mutex<Option<Instant>> = Mutex::new(None);
+/// The service thread's tick period while only a scan is running. Longer than
+/// a frame at any rate worth scanning at, so [`SCAN_WINDOW`] ticks still span
+/// a whole frame of barriers and [`READBACK_LATENCY`] ticks still outlast the
+/// GPU.
+const IDLE_TICK_PERIOD: Duration = Duration::from_millis(50);
+
+/// Frames ticked so far (diagnostics).
+pub fn frames_ticked() -> u64 {
+    CAPTURE_FRAME.load(Ordering::Acquire)
+}
+
+/// The frame tick: advance the frame counter, drive the live stream, and
+/// finish a layer scan once its copies have executed.
+///
+/// There is no `Present` hook to call this (`crate::hook`'s header has why).
+/// While a stream runs, [`crate::stream`] calls it as each nose frame's slot
+/// fills; while only a scan runs, the service thread does ([`idle_tick`]).
 pub fn tick() {
+    if TICKING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tick_inner();
+    TICKING.store(false, Ordering::Release);
+}
+
+/// The service thread's tick, for a layer scan with no stream to pace it.
+/// Call it every service loop: it does nothing while a stream is running
+/// (the stream paces the scan then) or while no scan is in progress, and
+/// otherwise ticks once per [`IDLE_TICK_PERIOD`].
+pub fn idle_tick() {
+    if crate::stream::stream_active() {
+        return;
+    }
+    let scanning =
+        SCAN_DEADLINE.load(Ordering::Acquire) != 0 || SCAN_READY_FRAME.load(Ordering::Acquire) != 0;
+    if !scanning {
+        return;
+    }
+    let due = match LAST_IDLE_TICK.lock() {
+        Ok(mut last) => {
+            let due = last.is_none_or(|t| t.elapsed() >= IDLE_TICK_PERIOD);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        }
+        Err(_) => false,
+    };
+    if due {
+        tick();
+    }
+}
+
+fn tick_inner() {
     let frame = CAPTURE_FRAME.fetch_add(1, Ordering::AcqRel) + 1;
 
     // Continuous stream: read back the ready frame and publish it, then rotate

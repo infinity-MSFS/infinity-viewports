@@ -1,64 +1,61 @@
-//! D3D12 / DXGI vtable-slot hook installation (Milestone B: `Present`).
+//! D3D12 vtable-slot hook installation.
 //!
 //! We never patch code bytes. To hook a COM method we read the interface's
 //! vtable from a throwaway instance we create ourselves, then swap one slot in
-//! that vtable. DXGI returns a single underlying swap-chain implementation whose
-//! vtable is shared by every swap chain in the process, so swapping the
-//! `IDXGISwapChain::Present` slot (index 8) on our dummy swap chain's vtable
-//! installs the hook for the sim's real swap chain too. After the swap we drop
-//! the dummy device/queue/swap chain and destroy the window — the vtable lives
-//! in the DXGI module and persists.
+//! that vtable; the vtable is shared by every instance of that class in the
+//! process, so the sim's own objects call the hook too.
 //!
-//! The hook runs on the sim's present thread, so it does no allocation or
-//! logging; it records what it observes (present count, backbuffer dimensions
-//! and format) into atomics that the bridge's service thread reads.
+//! # No swap chain, no `Present` hook
+//!
+//! This module used to create a throwaway DXGI swap chain as well and swap its
+//! `Present` slot for a once-a-frame tick. That is gone, and must not come
+//! back. `CreateDXGIFactory2` / `CreateSwapChainForHwnd` are intercepted by
+//! every graphics injector a user may run (Streamline's `sl.interposer`,
+//! ReShade, OptiScaler / OptiShade), so the "throwaway" swap chain was really
+//! a second swap chain announced to all of them and then destroyed. Measured
+//! on 23 Nov 2026 (MSFS 2024 1.9.24, OptiShade + ReShade 6.8 + Streamline
+//! 2.13/2.14): from that moment the injectors' chain handed the real
+//! `CDXGISwapChain::Present` a `this` that was OptiScaler's wrapper object,
+//! and DXGI read a garbage pointer at `this+0x820` on every present. With DLSS
+//! frame generation on, that is an access violation on `sl.dlss_g`'s present
+//! thread and the sim dies; with it off, Streamline catches the fault and
+//! writes an 8 MB minidump per frame, which is a sim at one frame a second.
+//! The slot swap had also landed on `sl.interposer`'s proxy vtable, not
+//! DXGI's: the old assumption that a dummy object's vtable is the system
+//! module's does not hold once anything wraps the factory.
+//!
+//! The frame tick now comes from the stream itself ([`crate::stream`]: a slot
+//! holding both of its layers is a finished nose frame), and from the service
+//! thread while only a layer scan is running ([`crate::capture::idle_tick`]).
+//!
+//! The throwaway DEVICE and COMMAND LIST remain. They too may come back
+//! wrapped (ReShade's proxies, on the machine above); hooking a wrapper's
+//! vtable still sees every call the sim makes through it, and the install log
+//! names the module each hooked vtable lives in so a report says which.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
-    D3D12_RENDER_TARGET_VIEW_DESC, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_DESC,
-    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-    D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device,
-    ID3D12GraphicsCommandList, ID3D12Resource,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGISwapChain,
-    IDXGISwapChain1,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_RENDER_TARGET_VIEW_DESC,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_DESC, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12CreateDevice, ID3D12CommandAllocator,
+    ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
 };
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-    GetModuleHandleExW,
+    GetModuleFileNameW, GetModuleHandleExW,
 };
 use windows::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtect,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UnregisterClassW,
-    WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-};
 use windows::core::GUID;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{Interface, PCWSTR};
 
-/// `IDXGISwapChain::Present` signature.
-type PresentFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> windows::core::HRESULT;
-/// `ID3D12CommandQueue::ExecuteCommandLists` signature.
-type EclFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-
-/// `IDXGISwapChain` vtable slot for `Present` (IUnknown 0-2, IDXGIObject 3-6,
-/// IDXGIDeviceSubObject 7, then `Present` at 8).
-const PRESENT_SLOT: usize = 8;
-/// `ID3D12CommandQueue` vtable slot for `ExecuteCommandLists` (IUnknown 0-2,
-/// ID3D12Object 3-6, ID3D12DeviceChild 7, ID3D12Pageable adds none, then
-/// UpdateTileMappings 8, CopyTileMappings 9, `ExecuteCommandLists` 10).
-const ECL_SLOT: usize = 10;
 /// `ID3D12Device` vtable slots: `CreateCommittedResource` is 27 and
 /// `CreatePlacedResource` is 29 (IUnknown 0-2, ID3D12Object 3-6, then the
 /// ID3D12Device methods 7.. in declaration order).
@@ -140,20 +137,9 @@ type CreatePlacedFn = unsafe extern "system" fn(
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 // Address of each swapped vtable slot (the `*mut usize` entry), recorded at
 // install so teardown can write the original pointer straight back.
-static PRESENT_ENTRY: AtomicUsize = AtomicUsize::new(0);
-static ECL_ENTRY: AtomicUsize = AtomicUsize::new(0);
 static CCR_ENTRY: AtomicUsize = AtomicUsize::new(0);
 static CPR_ENTRY: AtomicUsize = AtomicUsize::new(0);
 static RB_ENTRY: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
-static BB_W: AtomicU32 = AtomicU32::new(0);
-static BB_H: AtomicU32 = AtomicU32::new(0);
-static BB_FMT: AtomicU32 = AtomicU32::new(0);
-
-static ECL_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
-static ECL_SUBMITS: AtomicU64 = AtomicU64::new(0);
-static ECL_LISTS: AtomicU64 = AtomicU64::new(0);
 
 static CCR_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static CPR_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
@@ -255,68 +241,8 @@ fn record_resource(desc: *const D3D12_RESOURCE_DESC) {
     record_desc(unsafe { &*desc }, false);
 }
 
-/// What the hooks have observed so far.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Observed {
-    pub present_count: u64,
-    pub backbuffer_w: u32,
-    pub backbuffer_h: u32,
-    pub backbuffer_format: u32,
-    /// `ExecuteCommandLists` calls observed (all queues).
-    pub ecl_submits: u64,
-    /// Cumulative command lists submitted.
-    pub ecl_lists: u64,
-}
-
-/// Snapshot the hooks' observations (lock-free).
-pub fn observed() -> Observed {
-    Observed {
-        present_count: PRESENT_COUNT.load(Ordering::Relaxed),
-        backbuffer_w: BB_W.load(Ordering::Relaxed),
-        backbuffer_h: BB_H.load(Ordering::Relaxed),
-        backbuffer_format: BB_FMT.load(Ordering::Relaxed),
-        ecl_submits: ECL_SUBMITS.load(Ordering::Relaxed),
-        ecl_lists: ECL_LISTS.load(Ordering::Relaxed),
-    }
-}
-
 pub fn is_installed() -> bool {
     INSTALLED.load(Ordering::Acquire)
-}
-
-/// Our replacement `Present`: record, then tail-call the original. Runs on the
-/// sim's present thread — no allocation, no logging, just atomics.
-unsafe extern "system" fn present_hook(
-    this: *mut c_void,
-    sync_interval: u32,
-    flags: u32,
-) -> windows::core::HRESULT {
-    PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Capture the backbuffer description once.
-    if BB_W.load(Ordering::Relaxed) == 0 {
-        if let Some(sc) = unsafe { IDXGISwapChain::from_raw_borrowed(&this) } {
-            if let Ok(desc) = unsafe { sc.GetDesc() } {
-                BB_H.store(desc.BufferDesc.Height, Ordering::Relaxed);
-                BB_FMT.store(desc.BufferDesc.Format.0 as u32, Ordering::Relaxed);
-                // Store width last: it is the "ready" flag other reads key on.
-                BB_W.store(desc.BufferDesc.Width, Ordering::Release);
-            }
-        }
-    }
-    let orig: PresentFn = unsafe { core::mem::transmute(PRESENT_ORIGINAL.load(Ordering::Acquire)) };
-    let r = unsafe { orig(this, sync_interval, flags) };
-    crate::capture::tick();
-    r
-}
-
-/// Our replacement `ExecuteCommandLists`: count, then tail-call the original.
-/// Read-only — never touches the command lists. Fires for every command queue
-/// in the process (the vtable is shared).
-unsafe extern "system" fn ecl_hook(this: *mut c_void, num_lists: u32, lists: *const *mut c_void) {
-    ECL_SUBMITS.fetch_add(1, Ordering::Relaxed);
-    ECL_LISTS.fetch_add(num_lists as u64, Ordering::Relaxed);
-    let orig: EclFn = unsafe { core::mem::transmute(ECL_ORIGINAL.load(Ordering::Acquire)) };
-    unsafe { orig(this, num_lists, lists) }
 }
 
 /// Our replacement `CreateCommittedResource`: record the desc, tail-call.
@@ -628,41 +554,30 @@ unsafe fn restore_slot(entry: usize, hook_addr: usize, original: usize) -> bool 
 unsafe fn restore_installed_slots() -> u32 {
     unsafe {
         restore_one(
-            &PRESENT_ENTRY,
-            &PRESENT_ORIGINAL,
-            present_hook as PresentFn as usize,
-        ) + restore_one(&ECL_ENTRY, &ECL_ORIGINAL, ecl_hook as EclFn as usize)
-            + restore_one(
-                &CCR_ENTRY,
-                &CCR_ORIGINAL,
-                ccr_hook as CreateCommittedFn as usize,
-            )
-            + restore_one(
-                &CPR_ENTRY,
-                &CPR_ORIGINAL,
-                cpr_hook as CreatePlacedFn as usize,
-            )
-            + restore_one(
-                &RB_ENTRY,
-                &RB_ORIGINAL,
-                rb_hook as ResourceBarrierFn as usize,
-            )
-            + restore_one(
-                &CRTV_ENTRY,
-                &CRTV_ORIGINAL,
-                crtv_hook as CreateRtvFn as usize,
-            )
-            + restore_one(
-                &CLOSE_ENTRY,
-                &CLOSE_ORIGINAL,
-                close_hook as CloseFn as usize,
-            )
-            + restore_one(
-                &RESET_ENTRY,
-                &RESET_ORIGINAL,
-                reset_hook as ResetFn as usize,
-            )
-            + restore_one(&OM_ENTRY, &OM_ORIGINAL, om_hook as OmSetFn as usize)
+            &CCR_ENTRY,
+            &CCR_ORIGINAL,
+            ccr_hook as CreateCommittedFn as usize,
+        ) + restore_one(
+            &CPR_ENTRY,
+            &CPR_ORIGINAL,
+            cpr_hook as CreatePlacedFn as usize,
+        ) + restore_one(
+            &RB_ENTRY,
+            &RB_ORIGINAL,
+            rb_hook as ResourceBarrierFn as usize,
+        ) + restore_one(
+            &CRTV_ENTRY,
+            &CRTV_ORIGINAL,
+            crtv_hook as CreateRtvFn as usize,
+        ) + restore_one(
+            &CLOSE_ENTRY,
+            &CLOSE_ORIGINAL,
+            close_hook as CloseFn as usize,
+        ) + restore_one(
+            &RESET_ENTRY,
+            &RESET_ORIGINAL,
+            reset_hook as ResetFn as usize,
+        ) + restore_one(&OM_ENTRY, &OM_ORIGINAL, om_hook as OmSetFn as usize)
     }
 }
 
@@ -680,22 +595,25 @@ unsafe fn restore_one(entry: &AtomicUsize, original: &AtomicUsize, hook: usize) 
     u32::from(ok)
 }
 
-pub fn uninstall_present() -> String {
+pub fn uninstall_hooks() -> String {
     if !INSTALLED.swap(false, Ordering::AcqRel) {
         return "hooks were not installed".into();
     }
     let n = unsafe { restore_installed_slots() };
-    format!("restored {n}/9 hooked vtable slots; render path left as found")
+    format!("restored {n}/{HOOKED_SLOTS} hooked vtable slots; render path left as found")
 }
 
-/// Install the D3D12/DXGI vtable hooks (`Present` + `ExecuteCommandLists`).
-/// Idempotent. Returns a description on success, or a reason string on failure.
+/// Vtable slots [`install_hooks`] swaps.
+const HOOKED_SLOTS: u32 = 7;
+
+/// Install the D3D12 vtable hooks. Idempotent. Returns a description on
+/// success, or a reason string on failure.
 ///
 /// `step` is called with a short label BEFORE each OS/D3D call that could
 /// block, so a log written from it names the call a hung install is stuck in
 /// (a second install into a live sim once never returned, and the only line
 /// logged was the one before it).
-pub fn install_present(step: &mut dyn FnMut(&str)) -> Result<String, String> {
+pub fn install_hooks(step: &mut dyn FnMut(&str)) -> Result<String, String> {
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Ok("hooks already installed".into());
     }
@@ -712,130 +630,42 @@ pub fn install_present(step: &mut dyn FnMut(&str)) -> Result<String, String> {
     }
 }
 
-unsafe fn install_inner(step: &mut dyn FnMut(&str)) -> Result<String, String> {
-    unsafe {
-        // The window class belongs to THIS DLL, not the sim's exe, and is
-        // unregistered before returning (`WindowGuard`). Registered under the
-        // exe it outlived the bridge that registered it, so a later bridge's
-        // RegisterClassW failed quietly and CreateWindowExW used the old
-        // class, whose window procedure could point into the unloaded DLL.
-        // (A suspect for the hung second install, not a proven cause.)
-        step("module handle");
-        let mut module = HMODULE::default();
+/// File name of the module `addr` lies in, for the install log: whose vtable
+/// a hook really landed on (`D3D12Core.dll`, or a wrapper's such as
+/// `ReShade64.dll`). Never fails; an address in no module says so.
+fn module_of(addr: usize) -> String {
+    let mut module = HMODULE::default();
+    let found = unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCWSTR(wndproc as *const () as *const u16),
+            PCWSTR(addr as *const u16),
             &mut module,
         )
-        .map_err(|e| format!("GetModuleHandleExW: {e}"))?;
-        let hinst: HINSTANCE = module.into();
+    };
+    if found.is_err() || module.is_invalid() {
+        return "no module".into();
+    }
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
+    let path = String::from_utf16_lossy(buf.get(..n).unwrap_or(&[]));
+    path.rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unnamed module")
+        .to_string()
+}
 
-        // Minimal hidden window to back the dummy swap chain.
-        let class = w!("InfinityViewportsDummyWnd");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst,
-            lpszClassName: class,
-            ..Default::default()
-        };
-        step("register window class");
-        // A class left by a crashed earlier attempt of THIS module is ours
-        // too; drop it so the registration below is the live one.
-        let _ = UnregisterClassW(class, Some(hinst));
-        if RegisterClassW(&wc) == 0 {
-            return Err("RegisterClassW failed".into());
-        }
-        step("create window");
-        let created = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class,
-            w!("infinity-viewports"),
-            WS_OVERLAPPEDWINDOW,
-            0,
-            0,
-            8,
-            8,
-            None,
-            None,
-            Some(hinst),
-            None,
-        );
-        let hwnd = match created {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = UnregisterClassW(class, Some(hinst));
-                return Err(format!("CreateWindowExW: {e}"));
-            }
-        };
-        let _wnd = WindowGuard { hwnd, class, hinst };
-
-        // Dummy device + direct queue.
+unsafe fn install_inner(step: &mut dyn FnMut(&str)) -> Result<String, String> {
+    unsafe {
+        // A throwaway device and one command list off it: the two vtables the
+        // hooks live on. NO command queue and NO swap chain (module header):
+        // both are things Streamline's frame generation tracks.
         step("D3D12CreateDevice");
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device)
             .map_err(|e| format!("D3D12CreateDevice: {e}"))?;
         let device = device.ok_or("D3D12CreateDevice returned no device")?;
-        let qdesc = D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        };
-        step("CreateCommandQueue");
-        let queue: ID3D12CommandQueue = device
-            .CreateCommandQueue(&qdesc)
-            .map_err(|e| format!("CreateCommandQueue: {e}"))?;
 
-        // Dummy flip swap chain on that queue.
-        step("CreateDXGIFactory2");
-        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
-            .map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let scdesc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: 8,
-            Height: 8,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            ..Default::default()
-        };
-        step("CreateSwapChainForHwnd");
-        let swap: IDXGISwapChain1 = factory
-            .CreateSwapChainForHwnd(&queue, hwnd, &scdesc, None, None)
-            .map_err(|e| format!("CreateSwapChainForHwnd: {e}"))?;
-
-        step("swap vtable slots");
-        // Swap IDXGISwapChain::Present (slot 8).
-        let present_vtbl = *(swap.as_raw() as *const *mut usize);
-        let (present_entry, present_orig) = swap_slot(
-            swap.as_raw(),
-            PRESENT_SLOT,
-            present_hook as PresentFn as usize,
-        )?;
-        PRESENT_ENTRY.store(present_entry, Ordering::Release);
-        PRESENT_ORIGINAL.store(present_orig, Ordering::Release);
-
-        // Swap ID3D12CommandQueue::ExecuteCommandLists (slot 10).
-        let (ecl_entry, ecl_orig) =
-            swap_slot(queue.as_raw(), ECL_SLOT, ecl_hook as EclFn as usize)?;
-        ECL_ENTRY.store(ecl_entry, Ordering::Release);
-        ECL_ORIGINAL.store(ecl_orig, Ordering::Release);
-
-        // Swap ID3D12Device resource-creation slots (shared device vtable).
-        let dev_raw = device.as_raw();
-        let (ccr_entry, ccr_orig) =
-            swap_slot(dev_raw, CCR_SLOT, ccr_hook as CreateCommittedFn as usize)?;
-        CCR_ENTRY.store(ccr_entry, Ordering::Release);
-        CCR_ORIGINAL.store(ccr_orig, Ordering::Release);
-        let (cpr_entry, cpr_orig) =
-            swap_slot(dev_raw, CPR_SLOT, cpr_hook as CreatePlacedFn as usize)?;
-        CPR_ENTRY.store(cpr_entry, Ordering::Release);
-        CPR_ORIGINAL.store(cpr_orig, Ordering::Release);
-
-        // Dummy command list, to get the ID3D12GraphicsCommandList vtable, and
-        // swap ResourceBarrier (slot 26).
         step("CreateCommandList");
         let alloc: ID3D12CommandAllocator = device
             .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -844,23 +674,40 @@ unsafe fn install_inner(step: &mut dyn FnMut(&str)) -> Result<String, String> {
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
             .map_err(|e| format!("CreateCommandList: {e}"))?;
         let _ = list.Close();
-        let (rb_entry, rb_orig) = swap_slot(
-            list.as_raw(),
-            RB_SLOT,
-            rb_hook as ResourceBarrierFn as usize,
-        )?;
-        RB_ENTRY.store(rb_entry, Ordering::Release);
-        RB_ORIGINAL.store(rb_orig, Ordering::Release);
 
-        step("swap cloud-redirect slots");
-        // Nose cloud redirect. These three sit on the same vtables as the slots
-        // above, so a sim that already calls ResourceBarrier / CreateCommittedResource
-        // calls these too.
+        let dev_raw = device.as_raw();
+        let list_raw = list.as_raw();
+        let dev_vtbl = *(dev_raw as *const usize);
+        let list_vtbl = *(list_raw as *const usize);
+        let owners = format!(
+            "device vtable {dev_vtbl:#x} in {}, command-list vtable {list_vtbl:#x} in {}",
+            module_of(dev_vtbl),
+            module_of(list_vtbl)
+        );
+
+        // ID3D12Device: the two resource-creation slots and the cloud
+        // redirect's CreateRenderTargetView (one shared device vtable).
+        step("swap device slots");
+        let (ccr_entry, ccr_orig) =
+            swap_slot(dev_raw, CCR_SLOT, ccr_hook as CreateCommittedFn as usize)?;
+        CCR_ENTRY.store(ccr_entry, Ordering::Release);
+        CCR_ORIGINAL.store(ccr_orig, Ordering::Release);
+        let (cpr_entry, cpr_orig) =
+            swap_slot(dev_raw, CPR_SLOT, cpr_hook as CreatePlacedFn as usize)?;
+        CPR_ENTRY.store(cpr_entry, Ordering::Release);
+        CPR_ORIGINAL.store(cpr_orig, Ordering::Release);
         let (crtv_entry, crtv_orig) =
             swap_slot(dev_raw, CRTV_SLOT, crtv_hook as CreateRtvFn as usize)?;
         CRTV_ENTRY.store(crtv_entry, Ordering::Release);
         CRTV_ORIGINAL.store(crtv_orig, Ordering::Release);
-        let list_raw = list.as_raw();
+
+        // ID3D12GraphicsCommandList: ResourceBarrier (the capture point) and
+        // the cloud redirect's Close / Reset / OMSetRenderTargets.
+        step("swap command-list slots");
+        let (rb_entry, rb_orig) =
+            swap_slot(list_raw, RB_SLOT, rb_hook as ResourceBarrierFn as usize)?;
+        RB_ENTRY.store(rb_entry, Ordering::Release);
+        RB_ORIGINAL.store(rb_orig, Ordering::Release);
         let (close_entry, close_orig) =
             swap_slot(list_raw, CLOSE_SLOT, close_hook as CloseFn as usize)?;
         CLOSE_ENTRY.store(close_entry, Ordering::Release);
@@ -874,30 +721,8 @@ unsafe fn install_inner(step: &mut dyn FnMut(&str)) -> Result<String, String> {
         OM_ORIGINAL.store(om_orig, Ordering::Release);
 
         Ok(format!(
-            "hooks installed: Present (vtable {present_vtbl:p} slot {PRESENT_SLOT} orig {present_orig:#x}); ExecuteCommandLists (slot {ECL_SLOT} orig {ecl_orig:#x}); CreateCommittedResource (slot {CCR_SLOT} orig {ccr_orig:#x}); CreatePlacedResource (slot {CPR_SLOT} orig {cpr_orig:#x}); ResourceBarrier (slot {RB_SLOT} orig {rb_orig:#x}); CreateRenderTargetView (slot {CRTV_SLOT} orig {crtv_orig:#x}); Close (slot {CLOSE_SLOT} orig {close_orig:#x}); Reset (slot {RESET_SLOT} orig {reset_orig:#x}); OMSetRenderTargets (slot {OM_SLOT} orig {om_orig:#x})"
+            "hooks installed ({owners}): CreateCommittedResource (slot {CCR_SLOT} orig {ccr_orig:#x}); CreatePlacedResource (slot {CPR_SLOT} orig {cpr_orig:#x}); CreateRenderTargetView (slot {CRTV_SLOT} orig {crtv_orig:#x}); ResourceBarrier (slot {RB_SLOT} orig {rb_orig:#x}); Close (slot {CLOSE_SLOT} orig {close_orig:#x}); Reset (slot {RESET_SLOT} orig {reset_orig:#x}); OMSetRenderTargets (slot {OM_SLOT} orig {om_orig:#x})"
         ))
-        // _wnd drops here -> DestroyWindow; swap/queue/device/factory drop too.
-        // The patched DXGI/D3D12-module vtables persist.
+        // list/alloc/device drop here. The patched vtables persist.
     }
-}
-
-/// The dummy window and its class: destroyed, then unregistered, on drop.
-struct WindowGuard {
-    hwnd: HWND,
-    class: PCWSTR,
-    hinst: HINSTANCE,
-}
-impl Drop for WindowGuard {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.hwnd.is_invalid() {
-                let _ = DestroyWindow(self.hwnd);
-            }
-            let _ = UnregisterClassW(self.class, Some(self.hinst));
-        }
-    }
-}
-
-extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
